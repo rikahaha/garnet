@@ -60,6 +60,8 @@ namespace Tsavorite.core
                     break;
 
                 case Phase.PREPARE:
+                    if (CheckpointObjectTrace.Enabled)
+                        CheckpointObjectTrace.Mark("ckpt_prepare");
                     store._hybridLogCheckpointToken = guid;
                     store.InitializeHybridLogCheckpoint(store._hybridLogCheckpointToken, next.Version);
                     store._hybridLogCheckpoint.info.useSnapshotFile = 1;
@@ -111,6 +113,8 @@ namespace Tsavorite.core
                 case Phase.PERSISTENCE_CALLBACK:
                     // The snapshot flush has completed, and sessions are still in WAIT_FLUSH, where (v) objects are not modified in place.
                     // Return untouched pre-serialized objects to REST before PERSISTENCE_CALLBACK, where in-place updates resume.
+                    if (CheckpointObjectTrace.Enabled)
+                        CheckpointObjectTrace.Mark("ckpt_flushed");
                     StopPreSerializer();
 
                     // Set actual FlushedUntil to the latest possible data in main log that is on disk

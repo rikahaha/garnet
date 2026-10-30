@@ -61,6 +61,12 @@ namespace Tsavorite.core
                 // CopyUpdater does that, as it must ensure the object's (v1) data is not changed during the checkpoint.
                 if (SerializationPhase == SerializationPhase.REST && MakeTransition(SerializationPhase.REST, SerializationPhase.SERIALIZING))
                 {
+                    if (CheckpointPreSerializer.FlushCapture)
+                    {
+                        SerializeViaCapture(writer);
+                        return;
+                    }
+
                     // Directly serialize to wire, do not cache serialized state. Restore REST even if DoSerialize
                     // throws: leaving the object in SERIALIZING would make every later Serialize() and
                     // CacheSerializedObjectData() spin on it forever, wedging the checkpoint pipeline.
@@ -135,6 +141,67 @@ namespace Tsavorite.core
 
                 Thread.Yield();
             }
+        }
+
+        /// <summary>
+        /// Research prototype (TSAVORITE_FLUSH_CAPTURE=1): serialize into memory while holding SERIALIZING, release the object, and only
+        /// then write to <paramref name="writer"/>, so that a CopyUpdate does not wait for device I/O. During a checkpoint the capture is
+        /// also published as PRESERIALIZED, so that the CopyUpdate reuses it instead of serializing the object again.
+        /// </summary>
+        /// <remarks>The caller has moved the object from REST to SERIALIZING.</remarks>
+        void SerializeViaCapture(BinaryWriter writer)
+        {
+            var traceStart = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
+            var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
+
+            SerializedObjectData data;
+            try
+            {
+                data = SerializedObjectData.Capture(this);
+            }
+            catch
+            {
+                SerializationPhase = SerializationPhase.REST;
+                throw;
+            }
+
+            // Hold a reader reference across the write: once published, the data's owner is the object, and a reset may release it.
+            _ = data.TryAcquire();
+            var published = CheckpointPreSerializer.Current?.TryPublishFlushCapture(this, data) ?? false;
+            if (!published)
+                SerializationPhase = SerializationPhase.REST;
+            var traceReleased = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
+
+            try
+            {
+                WriteType(writer, isNull: false);
+                data.WriteTo(writer);
+            }
+            finally
+            {
+                data.Release();
+                if (!published)
+                    data.Release();
+            }
+
+            if (CheckpointObjectTrace.Enabled)
+            {
+                var end = CheckpointObjectTrace.Now();
+                CheckpointObjectTrace.Record(published ? "flush_capture_shared" : "flush_capture", this,
+                    totalUs: CheckpointObjectTrace.Us(traceStart, end), waitUs: 0,
+                    serializeUs: CheckpointObjectTrace.Us(traceStart, traceReleased),
+                    writeUs: CheckpointObjectTrace.Us(traceReleased, end), traceGc, data.Length);
+            }
+        }
+
+        /// <summary>
+        /// Publish <paramref name="data"/> as this object's pre-serialized (v) data. The caller holds the object in SERIALIZING and is
+        /// responsible for returning it to REST via <see cref="ResetPreSerialized"/> before the checkpoint ends.
+        /// </summary>
+        internal void PublishPreSerialized(SerializedObjectData data)
+        {
+            serializedData = data;
+            SerializationPhase = SerializationPhase.PRESERIALIZED;
         }
 
         /// <inheritdoc />
@@ -237,7 +304,7 @@ namespace Tsavorite.core
                     totalUs: CheckpointObjectTrace.Us(traceStart, end),
                     waitUs: CheckpointObjectTrace.Us(traceStart, serialized ? traceSerializeStart : end),
                     serializeUs: serialized ? CheckpointObjectTrace.Us(traceSerializeStart, traceSerializeEnd) : 0,
-                    toArrayUs: 0,
+                    writeUs: 0,
                     traceGc, serializedData?.Length ?? 0);
             }
         }
