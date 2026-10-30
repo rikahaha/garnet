@@ -58,7 +58,7 @@ class Conn:
 def main():
     shutil.rmtree(WORK, ignore_errors=True); os.makedirs(WORK)
     log = open(f"{WORK}/server.log", "w")
-    p = subprocess.Popen([*SERVER_CMD, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
+    p = subprocess.Popen([*SERVER_CMD, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt", "--device-type", "RandomAccess",
                           "--logger-level", "Information", "-m", "8g", "-i", "64m", *MODE_ARGS],
                          stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet", "TSAVORITE_COU_TRACE": f"{WORK}/trace.csv"})
     try:

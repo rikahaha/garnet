@@ -48,7 +48,7 @@ class Conn:
 
 def start(extra):
     log = open(f"{WORK}/server.log", "a")
-    p = subprocess.Popen([*SERVER_CMD, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
+    p = subprocess.Popen([*SERVER_CMD, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt", "--device-type", "RandomAccess",
                           "--logger-level", "Information", "-m", "4g", "-i", "64m", *extra],
                          stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet"})
     for _ in range(600):
