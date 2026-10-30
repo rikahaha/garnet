@@ -3,7 +3,6 @@
 
 using System.Diagnostics;
 using System.IO;
-using System.Text;
 using System.Threading;
 using static Tsavorite.core.Utility;
 
@@ -26,13 +25,13 @@ namespace Tsavorite.core
 
         int serializationPhaseInt;
 
-        /// <summary>The internal serialized bytes of the object.</summary>
-        byte[] serializedBytes;
+        /// <summary>The internal serialized (v) data of the object, cached during a checkpoint.</summary>
+        SerializedObjectData serializedData;
 
         /// <summary>
         /// Create a cloned (shallow copy) of this object
         /// </summary>
-        /// <remarks>The implementation of this method should NOT copy <see cref="serializedBytes"/>.</remarks>
+        /// <remarks>The implementation of this method should NOT copy <see cref="serializedData"/>.</remarks>
         public abstract IHeapObject Clone();
 
         /// <summary>
@@ -87,17 +86,24 @@ namespace Tsavorite.core
                 // If we are here, SerializationPhase is one of the .SERIALIZ* states. This means that one of the following is true:
                 // - Another thread is currently serializing this object (e.g. checkpoint and eviction)
                 // - CopyUpdate() is serializing this object
-                // - Serialization is complete. If the serializedBytes array is null, it means the checkpoint has completed and cleared it
+                // - Serialization is complete. If the serialized data is null (or released), it means the checkpoint has completed and cleared it
                 //   and the object has been superseded in the database so is no longer reachable, so we can write a null indicator.
 
                 if (SerializationPhase == SerializationPhase.SERIALIZED)
                 {
-                    // If serialized state is cached, use that
-                    var _serialized = serializedBytes;
-                    if (_serialized != null)
+                    // If serialized state is cached, use that. Data released under us was cleared after the checkpoint, the same as null.
+                    var _serialized = serializedData;
+                    if (_serialized != null && _serialized.TryAcquire())
                     {
-                        WriteType(writer, isNull: false);
-                        writer.Write(_serialized);
+                        try
+                        {
+                            WriteType(writer, isNull: false);
+                            _serialized.WriteTo(writer);
+                        }
+                        finally
+                        {
+                            _serialized.Release();
+                        }
                     }
                     else
                     {
@@ -111,11 +117,18 @@ namespace Tsavorite.core
                 // so if they are gone the phase has moved on; loop to observe it.
                 if (SerializationPhase == SerializationPhase.PRESERIALIZED)
                 {
-                    var _serialized = serializedBytes;
-                    if (_serialized != null)
+                    var _serialized = serializedData;
+                    if (_serialized != null && _serialized.TryAcquire())
                     {
-                        WriteType(writer, isNull: false);
-                        writer.Write(_serialized);
+                        try
+                        {
+                            WriteType(writer, isNull: false);
+                            _serialized.WriteTo(writer);
+                        }
+                        finally
+                        {
+                            _serialized.Release();
+                        }
                         return;
                     }
                 }
@@ -142,7 +155,7 @@ namespace Tsavorite.core
             // For pending-IO (DiskLogRecord) sources, skip the checkpoint-serialization state machine:
             //   - the (v) data is already persisted on disk from a prior flush, so there's nothing to capture;
             //   - 'this' is an ephemeral deserialized object that will be disposed up the pending chain, so
-            //     driving its SerializationPhase and allocating serializedBytes would be pure waste;
+            //     driving its SerializationPhase and allocating serialized data would be pure waste;
             //   - ClearSourceValueObject is ignored by InternalRMW for non-memory sources anyway.
             if (!srcIsOnMemoryLog)
                 return;
@@ -163,7 +176,7 @@ namespace Tsavorite.core
                     // Pre-serialized by a checkpoint whose flush has completed; the object is now superseded.
                     if (SerializationPhase == SerializationPhase.PRESERIALIZED && MakeTransition(SerializationPhase.PRESERIALIZED, SerializationPhase.SERIALIZED))
                     {
-                        _ = Interlocked.Exchange(ref serializedBytes, null);
+                        Interlocked.Exchange(ref serializedData, null)?.Release();
                         break;
                     }
 
@@ -177,7 +190,7 @@ namespace Tsavorite.core
             // of the object during a checkpoint while the (v+1) version of the record may modify the shallow-copied internal structures.
             var traceStart = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
             var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
-            long traceSerializeStart = 0, traceSerializeEnd = 0, traceToArrayEnd = 0;
+            long traceSerializeStart = 0, traceSerializeEnd = 0;
             while (true)
             {
                 if (SerializationPhase == (int)SerializationPhase.REST && MakeTransition(SerializationPhase.REST, SerializationPhase.SERIALIZING))
@@ -186,19 +199,14 @@ namespace Tsavorite.core
                     {
                         if (CheckpointObjectTrace.Enabled)
                             traceSerializeStart = CheckpointObjectTrace.Now();
-                        using var ms = new MemoryStream();
-                        using var writer = new BinaryWriter(ms, Encoding.UTF8);
-                        DoSerialize(writer);
+                        serializedData = SerializedObjectData.Capture(this);
                         if (CheckpointObjectTrace.Enabled)
                             traceSerializeEnd = CheckpointObjectTrace.Now();
-                        serializedBytes = ms.ToArray();
-                        if (CheckpointObjectTrace.Enabled)
-                            traceToArrayEnd = CheckpointObjectTrace.Now();
                     }
                     catch
                     {
                         // Publish no partial capture, and do not strand the object in SERIALIZING.
-                        serializedBytes = null;
+                        serializedData = null;
                         SerializationPhase = SerializationPhase.REST;
                         throw;
                     }
@@ -229,8 +237,8 @@ namespace Tsavorite.core
                     totalUs: CheckpointObjectTrace.Us(traceStart, end),
                     waitUs: CheckpointObjectTrace.Us(traceStart, serialized ? traceSerializeStart : end),
                     serializeUs: serialized ? CheckpointObjectTrace.Us(traceSerializeStart, traceSerializeEnd) : 0,
-                    toArrayUs: serialized ? CheckpointObjectTrace.Us(traceSerializeEnd, traceToArrayEnd) : 0,
-                    traceGc, serializedBytes?.LongLength ?? 0);
+                    toArrayUs: 0,
+                    traceGc, serializedData?.Length ?? 0);
             }
         }
 
@@ -252,14 +260,11 @@ namespace Tsavorite.core
             var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
             try
             {
-                using var ms = new MemoryStream();
-                using var writer = new BinaryWriter(ms, Encoding.UTF8);
-                DoSerialize(writer);
-                serializedBytes = ms.ToArray();
+                serializedData = SerializedObjectData.Capture(this);
             }
             catch
             {
-                serializedBytes = null;
+                serializedData = null;
                 SerializationPhase = SerializationPhase.REST;
                 return false;
             }
@@ -268,7 +273,7 @@ namespace Tsavorite.core
             if (CheckpointObjectTrace.Enabled)
             {
                 var us = CheckpointObjectTrace.Us(traceStart, CheckpointObjectTrace.Now());
-                CheckpointObjectTrace.Record("pre_serialize", this, us, 0, us, 0, traceGc, serializedBytes.LongLength);
+                CheckpointObjectTrace.Record("pre_serialize", this, us, 0, us, 0, traceGc, serializedData.Length);
             }
             return true;
         }
@@ -282,8 +287,10 @@ namespace Tsavorite.core
             // Hold SERIALIZING while clearing so that no reader sees PRESERIALIZED without bytes, or REST with stale ones.
             if (SerializationPhase != SerializationPhase.PRESERIALIZED || !MakeTransition(SerializationPhase.PRESERIALIZED, SerializationPhase.SERIALIZING))
                 return;
-            serializedBytes = null;
+            var data = serializedData;
+            serializedData = null;
             SerializationPhase = SerializationPhase.REST;
+            data?.Release();
         }
 
         /// <inheritdoc />
@@ -307,7 +314,7 @@ namespace Tsavorite.core
                 ResetPreSerialized();
                 return;
             }
-            _ = Interlocked.Exchange(ref serializedBytes, null);
+            Interlocked.Exchange(ref serializedData, null)?.Release();
         }
     }
 }
