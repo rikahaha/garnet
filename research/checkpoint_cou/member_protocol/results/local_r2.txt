@@ -1,0 +1,7 @@
+PASS: 4 snapshots, ordered two-task interleavings, update/delete/reinsert/growth, abort/retry, ownership, budgets, reclamation
+PASS: 100 fixed seeds x 3 generations x 200 mutation/scan steps against full reference model
+members,coverage,baseline_init_alloc_bytes,owner_init_alloc_bytes,extra_init_alloc_per_member,baseline_heap_delta,owner_heap_delta,extra_heap_per_member,baseline_update_ns,owner_normal_update_ns,owner_snapshot_update_ns,captures,capture_ns,set_gate_hold_ns,set_gate_wait_ns,scan_ns_per_member
+1000,0.01,142240,214392,72.15,188448,544560,356.11,546.75,74.71,78.24,10,8.30,50.82,12.71,4.75
+1000,0.8,142240,214392,72.15,188448,544560,356.11,546.75,74.71,78.92,800,10.32,50.13,13.51,4.38
+100000,0.01,12452376,19652576,72.00,12380408,26780456,144.00,45.75,81.51,92.16,1000,9.09,61.89,13.83,6.00
+100000,0.8,12452376,19652576,72.00,12380408,26780456,144.00,45.75,81.51,69.03,80000,9.92,43.42,10.53,6.78
