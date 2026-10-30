@@ -23,7 +23,7 @@ static class GcDiag
     static readonly bool Settle = Environment.GetEnvironmentVariable("GCDIAG_SETTLE") != "0";
 
     /// <summary>Records runtime-suspension intervals of GCs from the runtime's own event source.</summary>
-    sealed class GcPauseListener : EventListener
+    internal sealed class GcPauseListener : EventListener
     {
         readonly object sync = new();
         readonly List<(DateTime Start, DateTime End, int Generation)> pauses = new();

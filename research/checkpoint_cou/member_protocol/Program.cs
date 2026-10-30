@@ -200,6 +200,12 @@ static class Program
             GcDiag.Run(args[1], int.Parse(args[2]), int.Parse(args[3]), args.Length == 5 ? int.Parse(args[4]) : 600);
             return;
         }
+        if (args.Length is 4 or 6 && args[0] == "--churn")
+        {
+            ChurnDiag.Run(args[1], int.Parse(args[2]), int.Parse(args[3]),
+                args.Length == 6 ? int.Parse(args[4]) : 1_000_000, args.Length == 6 ? int.Parse(args[5]) : 200_000);
+            return;
+        }
         if (args.SequenceEqual(new[] { "--stress-only" }))
         {
             ConcurrentStress.Run();

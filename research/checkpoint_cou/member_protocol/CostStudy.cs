@@ -35,6 +35,18 @@ static class CostStudy
                 if (!tree.Add((score, key))) throw new Exception("Tree duplicate");
             }
         }
+        internal bool Remove(byte[] key)
+        {
+            lock (gate)
+            {
+                double old;
+                bool found = SnapshotOwner is null ? dictionary.TryGetValue(key, out old) : SnapshotOwner.TryGetScore(key, out old);
+                if (!found) return false;
+                if (!tree.Remove((old, key))) throw new Exception("Tree divergence");
+                if (SnapshotOwner is null) dictionary.Remove(key); else SnapshotOwner.Remove(key);
+                return true;
+            }
+        }
     }
     internal static byte[][] Keys(int count, int length) => Enumerable.Range(0, count).Select(i =>
     {
