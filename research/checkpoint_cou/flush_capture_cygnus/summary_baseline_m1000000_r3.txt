@@ -1,0 +1,7 @@
+mode=snapshot members/set=1000000 sets=20
+  before BGSAVE      n= 49425 p50=    38.7 p99=     46.6 max=     625.6 us
+  ckpt 1: first 1s  n=    23 p50= 58460.0 p99=  68157.9 max=   68157.9 us
+  ckpt 2: first 1s  n=  7276 p50=    39.5 p99=     48.6 max=   74246.7 us
+  later              n=122959 p50=    39.0 p99=     46.7 max=    2629.7 us
+  top 5 latencies (t_s, set, us): [(5.579441, 16, 74246.7), (5.176988, 6, 72981.7), (2.037141, 14, 68157.9), (2.595444, 15, 66055.2), (2.2269, 1, 65034.1)]
+  server RSS MB: before checkpoint 2534, peak 4110
