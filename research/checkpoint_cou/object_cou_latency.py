@@ -8,11 +8,14 @@ latency of ZADD on sorted sets of a given size, with a BGSAVE issued mid-run.
 
 usage: [MODE=snapshot|snapshot_tier|foldover_tier] object_cou_latency.py <members_per_set> [num_sets]
 """
-import os, shutil, signal, socket, subprocess, sys, time, random, csv
+import csv, os, random, shlex, shutil, signal, socket, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GARNET = os.path.join(HERE, "../../main/GarnetServer/bin/Release/net10.0/GarnetServer.dll")
 DOTNET = "/usr/local/share/dotnet/dotnet"
+# GARNET_BIN: a self-contained GarnetServer executable (e.g. published for linux-x64); otherwise run the local build with dotnet.
+# GARNET_NUMA: command prefix for the server, e.g. "numactl --cpunodebind=1 --membind=1".
+SERVER_CMD = shlex.split(os.environ.get("GARNET_NUMA", "")) + ([os.environ["GARNET_BIN"]] if os.environ.get("GARNET_BIN") else [DOTNET, GARNET])
 PORT = 6398
 MEMBERS = int(sys.argv[1]) if len(sys.argv) > 1 else 100000
 SETS = int(sys.argv[2]) if len(sys.argv) > 2 else 20
@@ -55,7 +58,7 @@ class Conn:
 def main():
     shutil.rmtree(WORK, ignore_errors=True); os.makedirs(WORK)
     log = open(f"{WORK}/server.log", "w")
-    p = subprocess.Popen([DOTNET, GARNET, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
+    p = subprocess.Popen([*SERVER_CMD, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
                           "--logger-level", "Information", "-m", "8g", "-i", "64m", *MODE_ARGS],
                          stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet", "TSAVORITE_COU_TRACE": f"{WORK}/trace.csv"})
     try:
@@ -81,6 +84,7 @@ def main():
             rows.append((round(a - t0, 6), s, round((time.perf_counter() - a) * 1e6, 1)))
     finally:
         p.send_signal(signal.SIGKILL); p.wait()
+        shutil.rmtree(f"{WORK}/ckpt", ignore_errors=True)   # keep only the logs; checkpoints are large
 
     out = os.path.join(HERE, f"lat_{MODE}_m{MEMBERS}_s{SETS}.csv")
     with open(out, "w", newline="") as f:
