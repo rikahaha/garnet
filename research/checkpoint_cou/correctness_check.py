@@ -8,11 +8,14 @@ B: writes continue during the checkpoint; with AOF, recovery (checkpoint + AOF r
 
 Run with and without TSAVORITE_PRESERIALIZE_THREADS set; both must print PASS.
 """
-import hashlib, os, random, shutil, signal, socket, subprocess, sys, time
+import hashlib, os, random, shlex, shutil, signal, socket, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GARNET = os.path.join(HERE, "../../main/GarnetServer/bin/Release/net10.0/GarnetServer.dll")
 DOTNET = "/usr/local/share/dotnet/dotnet"
+# GARNET_BIN: a self-contained GarnetServer executable (e.g. published for linux-x64); otherwise run the local build with dotnet.
+# GARNET_NUMA: command prefix for the server, e.g. "numactl --cpunodebind=1 --membind=1".
+SERVER_CMD = shlex.split(os.environ.get("GARNET_NUMA", "")) + ([os.environ["GARNET_BIN"]] if os.environ.get("GARNET_BIN") else [DOTNET, GARNET])
 PORT = 6397
 SETS, MEMBERS = 20, 200000
 WORK = os.path.join(HERE, "work_correctness")
@@ -45,7 +48,7 @@ class Conn:
 
 def start(extra):
     log = open(f"{WORK}/server.log", "a")
-    p = subprocess.Popen([DOTNET, GARNET, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
+    p = subprocess.Popen([*SERVER_CMD, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
                           "--logger-level", "Information", "-m", "4g", "-i", "64m", *extra],
                          stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet"})
     for _ in range(600):
@@ -125,4 +128,5 @@ def scenario_b():
 if __name__ == "__main__":
     print(f"TSAVORITE_PRESERIALIZE_THREADS={os.environ.get('TSAVORITE_PRESERIALIZE_THREADS', '0')}")
     ok = scenario_a() & scenario_b()
+    shutil.rmtree(WORK, ignore_errors=True)
     sys.exit(0 if ok else 1)
