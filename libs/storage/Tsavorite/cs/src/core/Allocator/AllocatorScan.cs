@@ -19,6 +19,12 @@ namespace Tsavorite.core
         internal virtual void ClearSerializedObjectData(long beginAddress, long endAddress) { }
 
         /// <summary>
+        /// Collect the heap objects of (v) records in the specified in-memory range whose heap size is at least <paramref name="minHeapSize"/>,
+        /// as candidates for checkpoint pre-serialization.
+        /// </summary>
+        internal virtual void CollectPreSerializeCandidates(long beginAddress, long endAddress, long minHeapSize, System.Collections.Generic.List<HeapObjectBase> candidates) { }
+
+        /// <summary>
         /// Pull-based scan interface for HLOG; user calls GetNext() which advances through the address range.
         /// </summary>
         /// <returns>Pull Scan iterator instance</returns>

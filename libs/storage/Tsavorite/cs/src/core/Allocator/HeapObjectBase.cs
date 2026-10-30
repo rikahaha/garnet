@@ -65,6 +65,8 @@ namespace Tsavorite.core
                     // Directly serialize to wire, do not cache serialized state. Restore REST even if DoSerialize
                     // throws: leaving the object in SERIALIZING would make every later Serialize() and
                     // CacheSerializedObjectData() spin on it forever, wedging the checkpoint pipeline.
+                    var traceStart = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
+                    var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
                     try
                     {
                         WriteType(writer, isNull: false);
@@ -73,6 +75,11 @@ namespace Tsavorite.core
                     finally
                     {
                         SerializationPhase = SerializationPhase.REST;
+                    }
+                    if (CheckpointObjectTrace.Enabled)
+                    {
+                        var us = CheckpointObjectTrace.Us(traceStart, CheckpointObjectTrace.Now());
+                        CheckpointObjectTrace.Record("flush_serialize", this, us, 0, us, 0, traceGc, 0);
                     }
                     return;
                 }
@@ -98,6 +105,19 @@ namespace Tsavorite.core
                         WriteType(writer, isNull: true);
                     }
                     return;
+                }
+
+                // Pre-serialized for the ongoing checkpoint. The bytes are cleared only after leaving PRESERIALIZED,
+                // so if they are gone the phase has moved on; loop to observe it.
+                if (SerializationPhase == SerializationPhase.PRESERIALIZED)
+                {
+                    var _serialized = serializedBytes;
+                    if (_serialized != null)
+                    {
+                        WriteType(writer, isNull: false);
+                        writer.Write(_serialized);
+                        return;
+                    }
                 }
 
                 Thread.Yield();
@@ -140,6 +160,13 @@ namespace Tsavorite.core
                     if ((int)SerializationPhase >= (int)SerializationPhase.SERIALIZED)
                         break;
 
+                    // Pre-serialized by a checkpoint whose flush has completed; the object is now superseded.
+                    if (SerializationPhase == SerializationPhase.PRESERIALIZED && MakeTransition(SerializationPhase.PRESERIALIZED, SerializationPhase.SERIALIZED))
+                    {
+                        _ = Interlocked.Exchange(ref serializedBytes, null);
+                        break;
+                    }
+
                     _ = Thread.Yield();
                 }
                 rmwInfo.ClearSourceValueObject = true;
@@ -148,16 +175,25 @@ namespace Tsavorite.core
 
             // Create a serialized version for checkpoint version (v). This is only done for CopyUpdate during a checkpoint, to preserve the (v) data
             // of the object during a checkpoint while the (v+1) version of the record may modify the shallow-copied internal structures.
+            var traceStart = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
+            var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
+            long traceSerializeStart = 0, traceSerializeEnd = 0, traceToArrayEnd = 0;
             while (true)
             {
                 if (SerializationPhase == (int)SerializationPhase.REST && MakeTransition(SerializationPhase.REST, SerializationPhase.SERIALIZING))
                 {
                     try
                     {
+                        if (CheckpointObjectTrace.Enabled)
+                            traceSerializeStart = CheckpointObjectTrace.Now();
                         using var ms = new MemoryStream();
                         using var writer = new BinaryWriter(ms, Encoding.UTF8);
                         DoSerialize(writer);
+                        if (CheckpointObjectTrace.Enabled)
+                            traceSerializeEnd = CheckpointObjectTrace.Now();
                         serializedBytes = ms.ToArray();
+                        if (CheckpointObjectTrace.Enabled)
+                            traceToArrayEnd = CheckpointObjectTrace.Now();
                     }
                     catch
                     {
@@ -178,8 +214,76 @@ namespace Tsavorite.core
                 if (SerializationPhase >= SerializationPhase.SERIALIZED)
                     break;
 
+                // 3. The checkpoint pre-serialized the (v) data; adopt those bytes as this CopyUpdate's capture.
+                if (SerializationPhase == SerializationPhase.PRESERIALIZED && MakeTransition(SerializationPhase.PRESERIALIZED, SerializationPhase.SERIALIZED))
+                    break;
+
                 _ = Thread.Yield();
             }
+
+            if (CheckpointObjectTrace.Enabled)
+            {
+                var end = CheckpointObjectTrace.Now();
+                var serialized = traceSerializeStart != 0;
+                CheckpointObjectTrace.Record(serialized ? "cou_serialize" : "cou_reuse", this,
+                    totalUs: CheckpointObjectTrace.Us(traceStart, end),
+                    waitUs: CheckpointObjectTrace.Us(traceStart, serialized ? traceSerializeStart : end),
+                    serializeUs: serialized ? CheckpointObjectTrace.Us(traceSerializeStart, traceSerializeEnd) : 0,
+                    toArrayUs: serialized ? CheckpointObjectTrace.Us(traceSerializeEnd, traceToArrayEnd) : 0,
+                    traceGc, serializedBytes?.LongLength ?? 0);
+            }
+        }
+
+        /// <summary>
+        /// Serialize the (v) data of a live object ahead of a CopyUpdate during a checkpoint, so that the CopyUpdate (on a request
+        /// thread) and the checkpoint flush can both reuse the bytes instead of serializing the object themselves.
+        /// </summary>
+        /// <remarks>
+        /// Only call this while no thread can modify (v) objects in place: after all (v) sessions and transactions have drained,
+        /// and before the checkpoint returns to REST. <see cref="ResetPreSerialized"/> must be called before that.
+        /// </remarks>
+        /// <returns>Whether the object was pre-serialized; false if it was already being (or had been) serialized.</returns>
+        internal bool TryPreSerialize()
+        {
+            if (SerializationPhase != SerializationPhase.REST || !MakeTransition(SerializationPhase.REST, SerializationPhase.SERIALIZING))
+                return false;
+
+            var traceStart = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
+            var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
+            try
+            {
+                using var ms = new MemoryStream();
+                using var writer = new BinaryWriter(ms, Encoding.UTF8);
+                DoSerialize(writer);
+                serializedBytes = ms.ToArray();
+            }
+            catch
+            {
+                serializedBytes = null;
+                SerializationPhase = SerializationPhase.REST;
+                return false;
+            }
+            SerializationPhase = SerializationPhase.PRESERIALIZED;
+
+            if (CheckpointObjectTrace.Enabled)
+            {
+                var us = CheckpointObjectTrace.Us(traceStart, CheckpointObjectTrace.Now());
+                CheckpointObjectTrace.Record("pre_serialize", this, us, 0, us, 0, traceGc, serializedBytes.LongLength);
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Return a pre-serialized object that no CopyUpdate superseded to <see cref="SerializationPhase.REST"/>, releasing its bytes.
+        /// Objects a CopyUpdate adopted are <see cref="SerializationPhase.SERIALIZED"/> and are left to <see cref="ClearSerializedObjectData"/>.
+        /// </summary>
+        internal void ResetPreSerialized()
+        {
+            // Hold SERIALIZING while clearing so that no reader sees PRESERIALIZED without bytes, or REST with stale ones.
+            if (SerializationPhase != SerializationPhase.PRESERIALIZED || !MakeTransition(SerializationPhase.PRESERIALIZED, SerializationPhase.SERIALIZING))
+                return;
+            serializedBytes = null;
+            SerializationPhase = SerializationPhase.REST;
         }
 
         /// <inheritdoc />
@@ -196,6 +300,13 @@ namespace Tsavorite.core
             // SERIALIZED with null bytes is the state Serialize() already documents as "superseded after
             // checkpoint completion": it writes a null indicator. That is safe because the superseding record
             // always sits at a higher address and carries the live data.
+            //
+            // A pre-serialized object is still live, so it must go back to REST rather than keep a terminal phase.
+            if (SerializationPhase == SerializationPhase.PRESERIALIZED)
+            {
+                ResetPreSerialized();
+                return;
+            }
             _ = Interlocked.Exchange(ref serializedBytes, null);
         }
     }
