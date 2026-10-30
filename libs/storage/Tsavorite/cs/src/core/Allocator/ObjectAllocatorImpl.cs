@@ -1562,6 +1562,76 @@ namespace Tsavorite.core
             }
         }
 
+        /// <inheritdoc />
+        internal override void CollectPreSerializeCandidates(long beginAddress, long endAddress, long minHeapSize, System.Collections.Generic.List<HeapObjectBase> candidates)
+        {
+            var address = beginAddress;
+            var epochTaken = epoch.ResumeIfNotProtected();
+            try
+            {
+                if (Initializing)
+                    return;
+
+                var stopAddress = Math.Min(endAddress, GetTailAddress());
+                var recordCount = 0;
+                while (address < stopAddress)
+                {
+                    // Do not hold back epoch-drain actions (e.g. page eviction) for the whole scan.
+                    if (epochTaken && ++recordCount % 1024 == 0)
+                    {
+                        epoch.Suspend();
+                        epoch.Resume();
+                    }
+
+                    var headAddress = Volatile.Read(ref HeadAddress);
+                    if (address < headAddress)
+                        address = headAddress;
+                    if (address >= stopAddress)
+                        return;
+
+                    var page = GetPage(address);
+                    var firstValidAddress = GetFirstValidLogicalAddressOnPage(page);
+                    if (address < firstValidAddress)
+                        address = firstValidAddress;
+                    if (address >= stopAddress)
+                        return;
+
+                    var offset = GetOffsetOnPage(address);
+                    if (offset == 0)
+                    {
+                        address = GetFirstValidLogicalAddressOnPage(page + 1);
+                        continue;
+                    }
+
+                    var physicalAddress = GetPhysicalAddress(address);
+                    var objectIdMap = objectPages[GetPageIndexForAddress(address)].objectIdMap;
+                    var logRecord = new LogRecord(physicalAddress, objectIdMap);
+                    var allocatedSize = logRecord.AllocatedSize;
+                    if (allocatedSize <= 0 || offset + allocatedSize > PageSize)
+                    {
+                        address = GetFirstValidLogicalAddressOnPage(page + 1);
+                        continue;
+                    }
+                    address += allocatedSize;
+
+                    // (v+1) records are live and mutable in place; only (v) data is frozen during the checkpoint.
+                    var dataHeader = logRecord.DataHeader;
+                    if (logRecord.Info.IsNull || logRecord.Info.Invalid || logRecord.Info.IsInNewVersion || !dataHeader.ValueIsObject)
+                        continue;
+
+                    var (_, valueAddress) = dataHeader.GetValueFieldInfo(physicalAddress);
+                    if (objectIdMap.TryGetHeapObject(*(int*)valueAddress, out var valueObject)
+                            && valueObject is HeapObjectBase heapObject && heapObject.HeapMemorySize >= minHeapSize)
+                        candidates.Add(heapObject);
+                }
+            }
+            finally
+            {
+                if (epochTaken)
+                    epoch.Suspend();
+            }
+        }
+
         /// <summary>
         /// Iterator interface for scanning Tsavorite log
         /// </summary>

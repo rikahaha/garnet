@@ -438,6 +438,10 @@ namespace Garnet
         [Option("checkpoint-throttle-delay", Required = false, HelpText = "Whether and by how much should we throttle the disk IO for checkpoints: -1 - disable throttling; >= 0 - run checkpoint flush in separate task, sleep for specified time after each WriteAsync")]
         public int CheckpointThrottleFlushDelayMs { get; set; }
 
+        [OptionValidation]
+        [Option("use-fold-over-checkpoints", Required = false, HelpText = "Use fold-over checkpoints instead of snapshots for SAVE, BGSAVE and background checkpoints. Requires storage tiering (--storage-tier).")]
+        public bool? UseFoldOverCheckpoints { get; set; }
+
 
         [IntRangeValidation(0, int.MaxValue)]
         [Option("fast-commit-throttle", Required = false, HelpText = "Throttle FastCommit to write metadata once every K commits.")]
@@ -1025,6 +1029,7 @@ namespace Garnet
                             UringSqPollIdleMs = DeviceUringSqPollIdleMs ?? 0,
                         }),
                 CheckpointThrottleFlushDelayMs = CheckpointThrottleFlushDelayMs,
+                UseFoldOverCheckpoints = UseFoldOverCheckpoints.GetValueOrDefault(),
                 EnableScatterGatherGet = EnableScatterGatherGet.GetValueOrDefault(true),
                 ReplicaSyncDelayMs = ReplicaSyncDelayMs,
                 AofReplayMaxLagBytes = AofReplayMaxLagBytes,

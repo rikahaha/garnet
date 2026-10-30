@@ -14,9 +14,39 @@ namespace Tsavorite.core
         where TStoreFunctions : IStoreFunctions
         where TAllocator : IAllocator<TStoreFunctions>
     {
+        CheckpointPreSerializer preSerializer;
+
         public SnapshotCheckpointSMTask(TsavoriteKV<TStoreFunctions, TAllocator> store, Guid guid)
             : base(store, guid)
         {
+        }
+
+        /// <summary>
+        /// Start pre-serializing large (v) objects. The phase after IN_PROGRESS is the first point at which no (v) session or
+        /// transaction can still modify (v) objects in place: the state machine leaves IN_PROGRESS only once they have drained.
+        /// </summary>
+        void StartPreSerializer()
+        {
+            if (preSerializer is not null || !CheckpointPreSerializer.Enabled)
+                return;
+            var hlogBase = store.hlogBase;
+            var beginAddress = hlogBase.HeadAddress;
+            var endAddress = hlogBase.GetTailAddress();
+            preSerializer = CheckpointPreSerializer.Start(candidates =>
+                hlogBase.CollectPreSerializeCandidates(beginAddress, endAddress, CheckpointPreSerializer.MinBytes, candidates));
+        }
+
+        void StopPreSerializer()
+        {
+            preSerializer?.StopAndReset();
+            preSerializer = null;
+        }
+
+        /// <inheritdoc />
+        public override void OnAbort(StateMachineDriver stateMachineDriver, Exception exception)
+        {
+            StopPreSerializer();
+            base.OnAbort(stateMachineDriver, exception);
         }
 
         /// <inheritdoc />
@@ -24,6 +54,11 @@ namespace Tsavorite.core
         {
             switch (next.Phase)
             {
+                case Phase.WAIT_INDEX_CHECKPOINT:
+                    StartPreSerializer();
+                    base.GlobalBeforeEnteringState(next, stateMachineDriver);
+                    break;
+
                 case Phase.PREPARE:
                     store._hybridLogCheckpointToken = guid;
                     store.InitializeHybridLogCheckpoint(store._hybridLogCheckpointToken, next.Version);
@@ -33,6 +68,7 @@ namespace Tsavorite.core
                     break;
 
                 case Phase.WAIT_FLUSH:
+                    StartPreSerializer();
                     base.GlobalBeforeEnteringState(next, stateMachineDriver);
 
                     store._hybridLogCheckpoint.info.snapshotFinalLogicalAddress = store._hybridLogCheckpoint.info.finalLogicalAddress;
@@ -73,6 +109,10 @@ namespace Tsavorite.core
                     break;
 
                 case Phase.PERSISTENCE_CALLBACK:
+                    // The snapshot flush has completed, and sessions are still in WAIT_FLUSH, where (v) objects are not modified in place.
+                    // Return untouched pre-serialized objects to REST before PERSISTENCE_CALLBACK, where in-place updates resume.
+                    StopPreSerializer();
+
                     // Set actual FlushedUntil to the latest possible data in main log that is on disk
                     // If we are using a NullDevice then storage tier is not enabled and FlushedUntilAddress may be ReadOnlyAddress; get all records in memory.
                     ObjectLog_OnPersistenceCallback();

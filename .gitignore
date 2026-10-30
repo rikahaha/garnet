@@ -223,3 +223,9 @@ BenchmarkDotNet.Artifacts/
 # Helm chart artifacts
 .cr-release-packages/
 libs/native/bftree-garnet/target/
+
+# research experiment scratch data and raw per-request latency logs
+research/**/work*/
+research/**/work_trace_*.csv
+research/**/lat_*.csv
+research/**/run_all.log
