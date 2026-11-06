@@ -5,7 +5,9 @@ using System.Text.Json;
 namespace MemberProtocol;
 
 // Sustained insert/delete churn: does the Owner's extra per-member object make GC more frequent or its pauses longer?
-// Variants: "baseline" (dictionary+tree), "owner" (Owner+tree), "scan1" (Owner+tree, one scan started mid-run).
+// Variants: "baseline" (dictionary+tree), "owner" (Owner+tree), "scan1" (Owner+tree, one scan started mid-run),
+// "scan1warm" (as scan1, with the scan code run once beforehand on a separate store).
+// Only Execute is timed: a GC triggered by allocating the fresh member in Prepare pauses outside every timed interval.
 // All variants execute the identical operation sequence: a fixed seed chooses which live member to delete, every
 // delete is followed by an insert of a fresh member, so the live member count stays at `count`.
 static class ChurnDiag
@@ -23,8 +25,11 @@ static class ChurnDiag
 
     internal static void Run(string variant, int count, int length, int operations, int warmup)
     {
-        if (variant is not ("baseline" or "owner" or "scan1"))
+        if (variant is not ("baseline" or "owner" or "scan1" or "scan1warm"))
             throw new ArgumentException(variant);
+        // scan1warm: as scan1, but the scan code has already run once (on a separate small store) before measuring,
+        // so its first batch does not JIT-compile while holding the gate, as in a server that has checkpointed before.
+        bool scanning = variant is "scan1" or "scan1warm";
         if (length < 4 || operations % 2 != 0 || warmup % 2 != 0)
             throw new ArgumentException("length >= 4 and even operation counts required");
         using var listener = new GcDiag.GcPauseListener();
@@ -56,20 +61,30 @@ static class ChurnDiag
         }
 
         for (int i = 0; i < warmup; i++) Execute(Prepare(i));
+        if (variant == "scan1warm")
+        {
+            var warm = new CostStudy.TreeStore(protocol: true);
+            foreach (var key in CostStudy.Keys(1000, length)) warm.Set(key, 0);
+            var owner = warm.SnapshotOwner!;
+            var view = owner.Begin();
+            try { while (!owner.Done(view)) _ = owner.Read(view); }
+            finally { owner.Close(view); }
+        }
         GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
         GC.WaitForPendingFinalizers();
         GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
 
         using var go = new ManualResetEventSlim();
         long scanStartTicks = 0, scanEndTicks = 0;
+        Owner.View? scanView = null;
         Task? scanner = null;
-        if (variant == "scan1")
+        if (scanning)
             scanner = Task.Factory.StartNew(() =>
             {
                 go.Wait();
                 var owner = store.SnapshotOwner!;
                 scanStartTicks = Stopwatch.GetTimestamp();
-                var view = owner.Begin();
+                var view = scanView = owner.Begin();
                 try { while (!owner.Done(view)) { _ = owner.Read(view); Thread.Yield(); } }
                 finally { owner.Close(view); }
                 scanEndTicks = Stopwatch.GetTimestamp();
@@ -77,6 +92,7 @@ static class ChurnDiag
 
         var starts = new long[operations];
         var ends = new long[operations];
+        var gateWait = new long[operations];  // writer gate wait of this operation (Owner variants only)
         int[] gcBefore = [GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2)];
         long allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
         var pauseBefore = GC.GetTotalPauseDuration();
@@ -85,10 +101,12 @@ static class ChurnDiag
         {
             if (i == operations / 2) go.Set();
             var fresh = Prepare(i);
+            _ = Owner.TakeThreadGateWaitTicks();
             long start = Stopwatch.GetTimestamp();
             Execute(fresh);
             ends[i] = Stopwatch.GetTimestamp();
             starts[i] = start;
+            gateWait[i] = Owner.TakeThreadGateWaitTicks();
         }
         long runEnd = Stopwatch.GetTimestamp();
         long allocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
@@ -119,6 +137,9 @@ static class ChurnDiag
 
         double Us(long ticks) => ticks * 1e6 / Stopwatch.Frequency;
         var latency = Enumerable.Range(0, operations).Select(i => Us(ends[i] - starts[i])).ToArray();
+        var waitUs = gateWait.Select(Us).ToArray();
+        // An operation is in the scan if its timed interval overlaps the scan interval.
+        bool InScan(int i) => scanning && ends[i] >= scanStartTicks && starts[i] <= scanEndTicks;
 
         object Dist(IEnumerable<double> values)
         {
@@ -129,15 +150,18 @@ static class ChurnDiag
 
         object Slow(double thresholdUs)
         {
-            int total = 0, overlapping = 0, mostlyPause = 0;
+            int total = 0, overlapping = 0, mostlyPause = 0, inScan = 0, mostlyGateWait = 0;
             for (int i = 0; i < operations; i++)
             {
                 if (latency[i] < thresholdUs) continue;
                 total++;
                 if (overlapUs[i] > 0) overlapping++;
                 if (overlapUs[i] >= latency[i] / 2) mostlyPause++;
+                if (InScan(i)) inScan++;
+                if (waitUs[i] >= latency[i] / 2) mostlyGateWait++;
             }
-            return new { thresholdUs, total, overlappingPause = overlapping, pauseAtLeastHalf = mostlyPause };
+            return new { thresholdUs, total, overlappingPause = overlapping, pauseAtLeastHalf = mostlyPause, inScan,
+                gateWaitAtLeastHalf = mostlyGateWait };
         }
 
         // Affinity is only exposed on Linux and Windows; on macOS it is reported as null.
@@ -173,7 +197,25 @@ static class ChurnDiag
             latencyOverlappingPauseUs = Dist(Enumerable.Range(0, operations).Where(i => overlapUs[i] > 0).Select(i => latency[i])),
             latencyNotOverlappingPauseUs = Dist(Enumerable.Range(0, operations).Where(i => overlapUs[i] == 0).Select(i => latency[i])),
             slow = new[] { Slow(SlowUs), Slow(SuspectUs) },
-            scanMs = variant == "scan1" ? Us(scanEndTicks - scanStartTicks) / 1000 : 0,
+            slowest = Enumerable.Range(0, operations).OrderByDescending(i => latency[i]).Take(10)
+                .Select(i => new { index = i, us = latency[i], gateWaitUs = waitUs[i], pauseOverlapUs = overlapUs[i], inScan = InScan(i) }).ToArray(),
+            slowestInScan = Enumerable.Range(0, operations).Where(InScan).OrderByDescending(i => latency[i]).Take(5)
+                .Select(i => new { index = i, us = latency[i], gateWaitUs = waitUs[i], pauseOverlapUs = overlapUs[i] }).ToArray(),
+            // GC suspensions that overlap the scan: a pause while the scanner holds the gate also stalls waiting writers.
+            pausesDuringScanUs = scanning
+                ? Dist(pauses.Where(p => p.End >= Utc(scanStartTicks) && p.Start <= Utc(scanEndTicks)).Select(p => (p.End - p.Start).TotalMilliseconds * 1000))
+                : null,
+            gateWaitUs = Dist(waitUs),
+            gateWaitInScanUs = Dist(Enumerable.Range(0, operations).Where(InScan).Select(i => waitUs[i])),
+            latencyInScanUs = Dist(Enumerable.Range(0, operations).Where(InScan).Select(i => latency[i])),
+            scanMs = scanning ? Us(scanEndTicks - scanStartTicks) / 1000 : 0,
+            scanner = scanView is null ? null : new
+            {
+                reads = scanView.Reads,
+                waitTotalUs = Us(scanView.ReadWaitTicks), waitMaxUs = Us(scanView.ReadWaitMaxTicks),
+                holdTotalUs = Us(scanView.ReadHoldTicks), holdMaxUs = Us(scanView.ReadHoldMaxTicks),
+                holdMaxBatch = scanView.ReadHoldMaxAt, firstBatchHoldUs = Us(scanView.FirstReadHoldTicks),
+            },
         }));
     }
 }

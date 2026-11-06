@@ -10,6 +10,7 @@ Optional:
                  recorded in each result as environment.numa.
   CHURN_BIN      path to a self-contained MemberProtocol executable (otherwise <dotnet> <dll>).
   CHURN_OPS / CHURN_WARMUP / CHURN_REPEATS / CHURN_COUNTS   scale; defaults 1000000 / 200000 / 3 / 10000,100000.
+  CHURN_LENGTHS / CHURN_VARIANTS / CHURN_GC_MODES   subsets; defaults 16,128 / baseline,owner,scan1 / workstation,server.
 """
 import json
 import os
@@ -32,6 +33,8 @@ ops = os.environ.get("CHURN_OPS", "1000000")
 warmup = os.environ.get("CHURN_WARMUP", "200000")
 repeats = int(os.environ.get("CHURN_REPEATS", "3"))
 counts = [int(c) for c in os.environ.get("CHURN_COUNTS", "10000,100000").split(",")]
+lengths = [int(n) for n in os.environ.get("CHURN_LENGTHS", "16,128").split(",")]
+variants = os.environ.get("CHURN_VARIANTS", "baseline,owner,scan1").split(",")
 
 base_env = {k: v for k, v in os.environ.items()
             if not (k.startswith(("DOTNET_", "COMPlus_")) and k != "DOTNET_ROOT")}
@@ -41,13 +44,15 @@ gc_modes = {
     "workstation": {"DOTNET_gcServer": "0"},
     "server": {"DOTNET_gcServer": "1", "DOTNET_GCHeapCount": str(cpus), "DOTNET_GCNoAffinitize": "1"},
 }
+selected_modes = os.environ.get("CHURN_GC_MODES", "workstation,server").split(",")
+gc_modes = {mode: gc_modes[mode] for mode in selected_modes}
 
 with output.open("x") as stream:
     for repeat in range(repeats):
         for mode, env in gc_modes.items():
             for count in counts:
-                for length in (16, 128):
-                    for variant in ("baseline", "owner", "scan1"):
+                for length in lengths:
+                    for variant in variants:
                         args = [*prefix, *program, "--churn", variant, str(count), str(length), ops, warmup]
                         result = subprocess.run(args, text=True, capture_output=True, check=True, timeout=600,
                                                 env={**base_env, **env})

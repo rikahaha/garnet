@@ -34,6 +34,8 @@ sealed class Owner
         internal readonly long Limit;
         internal Node? Cursor;
         internal bool Closed;
+        // Diagnostics: gate wait and hold of the reader's batches.
+        internal long Reads, ReadWaitTicks, ReadWaitMaxTicks, ReadHoldTicks, ReadHoldMaxTicks, ReadHoldMaxAt, FirstReadHoldTicks;
         public int Count { get; }
         internal View(Owner source, long limit, int count, Node? cursor)
             => (Source, Limit, Count, Cursor) = (source, limit, count, cursor);
@@ -51,6 +53,15 @@ sealed class Owner
     public long CaptureTicks { get; private set; }
     public long GateWaitTicks { get; private set; }
     public long GateHoldTicks { get; private set; }
+
+    // Diagnostics: gate wait of the calling thread's writer operations (Set, Remove, TryGetScore), accumulated until taken.
+    [ThreadStatic] static long threadGateWaitTicks;
+    internal static long TakeThreadGateWaitTicks()
+    {
+        var ticks = threadGateWaitTicks;
+        threadGateWaitTicks = 0;
+        return ticks;
+    }
     public int Slots { get { lock (gate) return slots; } }
     public long KeyBytes { get { lock (gate) return keyBytes; } }
     public int Count { get { lock (gate) return live.Count; } }
@@ -71,6 +82,7 @@ sealed class Owner
         {
             var acquired = Stopwatch.GetTimestamp();
             GateWaitTicks += acquired - start;
+            threadGateWaitTicks += acquired - start;
             try
             {
                 if (live.TryGetValue(key, out var node))
@@ -100,8 +112,10 @@ sealed class Owner
 
     public bool Remove(byte[] key)
     {
+        var start = Stopwatch.GetTimestamp();
         lock (gate)
         {
+            threadGateWaitTicks += Stopwatch.GetTimestamp() - start;
             if (!live.TryGetValue(key, out var node)) return false;
             Capture(node);
             live.Remove(key);
@@ -113,8 +127,10 @@ sealed class Owner
 
     internal bool TryGetScore(byte[] key, out double score)
     {
+        var start = Stopwatch.GetTimestamp();
         lock (gate)
         {
+            threadGateWaitTicks += Stopwatch.GetTimestamp() - start;
             if (live.TryGetValue(key, out var node)) { score = node.Score; return true; }
             score = 0;
             return false;
@@ -156,24 +172,45 @@ sealed class Owner
         if (maxNodes <= 0 || maxNodes > 1024 || maxBytes < maxMemberBytes || maxBytes > 1048576)
             throw new ArgumentOutOfRangeException();
         var rows = new List<Row>(maxNodes);
+        var waitStart = Stopwatch.GetTimestamp();
         lock (gate)
         {
-            Validate(view);
-            int bytes = 0, visited = 0;
-            while (view.Cursor is Node node && node.Id <= view.Limit && visited < maxNodes)
+            var acquired = Stopwatch.GetTimestamp();
+            try { ReadLocked(view, rows, maxNodes, maxBytes); }
+            finally
             {
-                if (node.Key.Length > maxBytes - bytes) break;
-                rows.Add(new Row(node.Key, node.HasOld ? node.OldScore : node.Score));
-                bytes += node.Key.Length;
-                visited++;
-                view.Cursor = node.Next;
-                node.HasOld = false;
-                if (!node.Live) Unlink(node);
+                var released = Stopwatch.GetTimestamp();
+                view.Reads++;
+                view.ReadWaitTicks += acquired - waitStart;
+                view.ReadWaitMaxTicks = Math.Max(view.ReadWaitMaxTicks, acquired - waitStart);
+                view.ReadHoldTicks += released - acquired;
+                if (view.Reads == 1) view.FirstReadHoldTicks = released - acquired;
+                if (released - acquired > view.ReadHoldMaxTicks)
+                {
+                    view.ReadHoldMaxTicks = released - acquired;
+                    view.ReadHoldMaxAt = view.Reads;  // 1-based batch number
+                }
             }
-            // Never retain a pointer to a new node: it can be removed immediately.
-            if (view.Cursor is Node next && next.Id > view.Limit) view.Cursor = null;
         }
         return rows;
+    }
+
+    void ReadLocked(View view, List<Row> rows, int maxNodes, int maxBytes)
+    {
+        Validate(view);
+        int bytes = 0, visited = 0;
+        while (view.Cursor is Node node && node.Id <= view.Limit && visited < maxNodes)
+        {
+            if (node.Key.Length > maxBytes - bytes) break;
+            rows.Add(new Row(node.Key, node.HasOld ? node.OldScore : node.Score));
+            bytes += node.Key.Length;
+            visited++;
+            view.Cursor = node.Next;
+            node.HasOld = false;
+            if (!node.Live) Unlink(node);
+        }
+        // Never retain a pointer to a new node: it can be removed immediately.
+        if (view.Cursor is Node next && next.Id > view.Limit) view.Cursor = null;
     }
 
     public bool Done(View view)
