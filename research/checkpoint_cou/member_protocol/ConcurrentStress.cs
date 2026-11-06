@@ -5,10 +5,10 @@ namespace MemberProtocol;
 
 static class ConcurrentStress
 {
-    public static void Run(int rounds = 2000)
+    public static void Run(OwnerOptions options, int rounds = 2000)
     {
         const int writers = 4;
-        var owner = new Owner(maxSlots: 2048);
+        var owner = OwnerFactory.Create(options, maxSlots: 2048);
         var keys = Enumerable.Range(0, 256).Select(i => Encoding.UTF8.GetBytes($"stress-{i:D4}")).ToArray();
         foreach (var key in keys) owner.Set(key, 0);
         var operations = new long[writers];
@@ -98,6 +98,6 @@ static class ConcurrentStress
             catch (OperationCanceledException) { }
         }
         if (roundsWithScanWrites == 0) throw new Exception("No writer progress during scan/close intervals");
-        Console.WriteLine($"PASS: concurrent rounds={rounds}, writers={writers}, complete={completed}, abort={aborted}, rounds_with_scan_or_close_writes={roundsWithScanWrites}, operations={operations.Sum()}, elapsed_ms={timer.ElapsedMilliseconds}");
+        Console.WriteLine($"PASS [{options}]: concurrent rounds={rounds}, writers={writers}, complete={completed}, abort={aborted}, rounds_with_scan_or_close_writes={roundsWithScanWrites}, operations={operations.Sum()}, elapsed_ms={timer.ElapsedMilliseconds}");
     }
 }

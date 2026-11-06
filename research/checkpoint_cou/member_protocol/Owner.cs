@@ -3,7 +3,8 @@ using System.Diagnostics;
 namespace MemberProtocol;
 
 // Standalone protocol only. No Garnet, CPR, persistence or command integration.
-sealed class Owner
+// One Node object per member; see ArrayOwner for the segmented-array layout of the same protocol.
+sealed class Owner : ISnapshotOwner
 {
     internal sealed class Bytes : IEqualityComparer<byte[]>
     {
@@ -28,19 +29,12 @@ sealed class Owner
     // Key storage is privately owned and never mutated or pooled. Consumers must not
     // mutate memory through interop; references remain valid after unlink/close.
     internal readonly record struct Row(ReadOnlyMemory<byte> Key, double Score);
-    internal sealed class View
+    internal sealed class View(Owner source, long limit, int count, Node? cursor) : SnapshotView(limit, count)
     {
-        internal readonly Owner Source;
-        internal readonly long Limit;
-        internal Node? Cursor;
-        internal bool Closed;
-        // Diagnostics: gate wait and hold of the reader's batches.
-        internal long Reads, ReadWaitTicks, ReadWaitMaxTicks, ReadHoldTicks, ReadHoldMaxTicks, ReadHoldMaxAt, FirstReadHoldTicks;
-        public int Count { get; }
-        internal View(Owner source, long limit, int count, Node? cursor)
-            => (Source, Limit, Count, Cursor) = (source, limit, count, cursor);
+        internal readonly Owner Source = source;
+        internal Node? Cursor = cursor;
     }
-    readonly object gate = new();
+    readonly Gate gate;
     readonly Dictionary<byte[], Node> live = new(new Bytes());
     readonly int maxSlots, maxMemberBytes;
     readonly long maxKeyBytes;
@@ -54,68 +48,63 @@ sealed class Owner
     public long GateWaitTicks { get; private set; }
     public long GateHoldTicks { get; private set; }
 
-    // Diagnostics: gate wait of the calling thread's writer operations (Set, Remove, TryGetScore), accumulated until taken.
-    [ThreadStatic] static long threadGateWaitTicks;
-    internal static long TakeThreadGateWaitTicks()
-    {
-        var ticks = threadGateWaitTicks;
-        threadGateWaitTicks = 0;
-        return ticks;
-    }
-    public int Slots { get { lock (gate) return slots; } }
-    public long KeyBytes { get { lock (gate) return keyBytes; } }
-    public int Count { get { lock (gate) return live.Count; } }
+    internal static long TakeThreadGateWaitTicks() => Gate.TakeThreadWaitTicks();
 
-    public Owner(int maxSlots = 2_000_000, long maxKeyBytes = 128L << 20, int maxMemberBytes = 4096, bool borrowKeys = false)
+    public int Slots { get { gate.Enter(); try { return slots; } finally { gate.Exit(); } } }
+    public long KeyBytes { get { gate.Enter(); try { return keyBytes; } finally { gate.Exit(); } } }
+    public int Count { get { gate.Enter(); try { return live.Count; } finally { gate.Exit(); } } }
+
+    public Owner(int maxSlots = 2_000_000, long maxKeyBytes = 128L << 20, int maxMemberBytes = 4096, bool borrowKeys = false,
+        bool writerPriority = false)
     {
         if (maxSlots <= 0 || maxKeyBytes < 0 || maxMemberBytes <= 0 || maxMemberBytes > 16384)
             throw new ArgumentOutOfRangeException();
         (this.maxSlots, this.maxKeyBytes, this.maxMemberBytes) = (maxSlots, maxKeyBytes, maxMemberBytes);
         // Benchmark only: caller guarantees these arrays remain immutable and alive.
         this.borrowKeys = borrowKeys;
+        gate = new Gate(writerPriority);
     }
 
     public void Set(byte[] key, double score)
     {
         var start = Stopwatch.GetTimestamp();
-        lock (gate)
+        var acquired = gate.EnterWriter(start);
+        GateWaitTicks += acquired - start;
+        try
         {
-            var acquired = Stopwatch.GetTimestamp();
-            GateWaitTicks += acquired - start;
-            threadGateWaitTicks += acquired - start;
-            try
+            if (live.TryGetValue(key, out var node))
             {
-                if (live.TryGetValue(key, out var node))
-                {
-                    Capture(node);
-                    node.Score = score;
-                    return;
-                }
-                // Budget rejection is before publication/mutation. Slot retention is
-                // bounded even if insert/delete runs forever during a paused snapshot.
-                if (key.Length > maxMemberBytes || slots >= maxSlots || key.Length > maxKeyBytes - keyBytes)
-                    throw new InvalidOperationException("Protocol capacity exceeded; mutation rejected");
-                var id = checked(lastId + 1);
-                node = new Node(borrowKeys ? key : key.ToArray(), score, id);
-                live.Add(node.Key, node);
-                lastId = id;
-                node.Prev = tail;
-                if (tail is null) head = node;
-                else tail.Next = node;
-                tail = node;
-                slots++;
-                keyBytes += node.Key.Length;
+                Capture(node);
+                node.Score = score;
+                return;
             }
-            finally { GateHoldTicks += Stopwatch.GetTimestamp() - acquired; }
+            // Budget rejection is before publication/mutation. Slot retention is
+            // bounded even if insert/delete runs forever during a paused snapshot.
+            if (key.Length > maxMemberBytes || slots >= maxSlots || key.Length > maxKeyBytes - keyBytes)
+                throw new InvalidOperationException("Protocol capacity exceeded; mutation rejected");
+            var id = checked(lastId + 1);
+            node = new Node(borrowKeys ? key : key.ToArray(), score, id);
+            live.Add(node.Key, node);
+            lastId = id;
+            node.Prev = tail;
+            if (tail is null) head = node;
+            else tail.Next = node;
+            tail = node;
+            slots++;
+            keyBytes += node.Key.Length;
+        }
+        finally
+        {
+            GateHoldTicks += Stopwatch.GetTimestamp() - acquired;
+            gate.Exit();
         }
     }
 
     public bool Remove(byte[] key)
     {
-        var start = Stopwatch.GetTimestamp();
-        lock (gate)
+        gate.EnterWriter(Stopwatch.GetTimestamp());
+        try
         {
-            threadGateWaitTicks += Stopwatch.GetTimestamp() - start;
             if (!live.TryGetValue(key, out var node)) return false;
             Capture(node);
             live.Remove(key);
@@ -123,18 +112,19 @@ sealed class Owner
             if (!Pending(node)) Unlink(node);
             return true;
         }
+        finally { gate.Exit(); }
     }
 
-    internal bool TryGetScore(byte[] key, out double score)
+    public bool TryGetScore(byte[] key, out double score)
     {
-        var start = Stopwatch.GetTimestamp();
-        lock (gate)
+        gate.EnterWriter(Stopwatch.GetTimestamp());
+        try
         {
-            threadGateWaitTicks += Stopwatch.GetTimestamp() - start;
             if (live.TryGetValue(key, out var node)) { score = node.Score; return true; }
             score = 0;
             return false;
         }
+        finally { gate.Exit(); }
     }
 
     bool Pending(Node node) => active is { Closed: false } view && node.Id <= view.Limit
@@ -150,9 +140,10 @@ sealed class Owner
         CaptureTicks += Stopwatch.GetTimestamp() - start;
     }
 
-    public View Begin(Action<IReadOnlyList<Row>>? captureForTest = null)
+    public SnapshotView Begin(Action<IReadOnlyList<Row>>? captureForTest = null)
     {
-        lock (gate)
+        gate.Enter();
+        try
         {
             if (active is not null) throw new InvalidOperationException("One active snapshot only");
             // Test oracle only: full copy under the same gate as the boundary.
@@ -163,41 +154,37 @@ sealed class Owner
             active = new View(this, lastId, live.Count, head);
             return active;
         }
+        finally { gate.Exit(); }
     }
 
     // At most maxNodes visited, at most maxBytes payload retained by this result.
     // Encoding/output belongs to caller outside gate. Caller must bound outstanding batches.
-    public List<Row> Read(View view, int maxNodes = 128, int maxBytes = 16384)
+    public List<Row> Read(SnapshotView view, int maxNodes = 128, int maxBytes = 16384)
     {
-        if (maxNodes <= 0 || maxNodes > 1024 || maxBytes < maxMemberBytes || maxBytes > 1048576)
-            throw new ArgumentOutOfRangeException();
         var rows = new List<Row>(maxNodes);
-        var waitStart = Stopwatch.GetTimestamp();
-        lock (gate)
-        {
-            var acquired = Stopwatch.GetTimestamp();
-            try { ReadLocked(view, rows, maxNodes, maxBytes); }
-            finally
-            {
-                var released = Stopwatch.GetTimestamp();
-                view.Reads++;
-                view.ReadWaitTicks += acquired - waitStart;
-                view.ReadWaitMaxTicks = Math.Max(view.ReadWaitMaxTicks, acquired - waitStart);
-                view.ReadHoldTicks += released - acquired;
-                if (view.Reads == 1) view.FirstReadHoldTicks = released - acquired;
-                if (released - acquired > view.ReadHoldMaxTicks)
-                {
-                    view.ReadHoldMaxTicks = released - acquired;
-                    view.ReadHoldMaxAt = view.Reads;  // 1-based batch number
-                }
-            }
-        }
+        ReadInto(view, rows, maxNodes, maxBytes);
         return rows;
     }
 
-    void ReadLocked(View view, List<Row> rows, int maxNodes, int maxBytes)
+    public void ReadInto(SnapshotView view, List<Row> rows, int maxNodes = 128, int maxBytes = 16384)
     {
-        Validate(view);
+        if (maxNodes <= 0 || maxNodes > 1024 || maxBytes < maxMemberBytes || maxBytes > 1048576)
+            throw new ArgumentOutOfRangeException();
+        rows.Clear();
+        var waitStart = Stopwatch.GetTimestamp();
+        gate.EnterReader();
+        var acquired = Stopwatch.GetTimestamp();
+        try { ReadLocked(view, rows, maxNodes, maxBytes); }
+        finally
+        {
+            view.RecordRead(waitStart, acquired, Stopwatch.GetTimestamp());
+            gate.Exit();
+        }
+    }
+
+    void ReadLocked(SnapshotView snapshot, List<Row> rows, int maxNodes, int maxBytes)
+    {
+        var view = Validate(snapshot);
         int bytes = 0, visited = 0;
         while (view.Cursor is Node node && node.Id <= view.Limit && visited < maxNodes)
         {
@@ -213,28 +200,34 @@ sealed class Owner
         if (view.Cursor is Node next && next.Id > view.Limit) view.Cursor = null;
     }
 
-    public bool Done(View view)
+    public bool Done(SnapshotView view)
     {
-        lock (gate) { Validate(view); return view.Cursor is null; }
+        gate.EnterReader();
+        try { return Validate(view).Cursor is null; }
+        finally { gate.Exit(); }
     }
 
     // Finish/abort drain in bounded critical sections. Writers keep running;
     // Begin remains rejected until all retained boundary nodes have been released.
-    public void Close(View view)
+    public void Close(SnapshotView view)
     {
         while (!Done(view)) _ = Read(view);
-        lock (gate) { Validate(view); view.Closed = true; active = null; }
+        gate.Enter();
+        try { Validate(view).Closed = true; active = null; }
+        finally { gate.Exit(); }
     }
 
-    void Validate(View view)
+    View Validate(SnapshotView snapshot)
     {
-        if (view.Source != this || active != view || view.Closed)
+        if (snapshot is not View view || view.Source != this || active != view || view.Closed)
             throw new InvalidOperationException("Inactive snapshot");
+        return view;
     }
 
-    internal void ValidateReclaimedForTest()
+    public void ValidateReclaimedForTest()
     {
-        lock (gate)
+        gate.Enter();
+        try
         {
             if (active is not null) throw new InvalidOperationException("Still active");
             int count = 0;
@@ -252,6 +245,7 @@ sealed class Owner
             if (count != slots || count != live.Count || bytes != keyBytes || previous != tail)
                 throw new InvalidOperationException("Invalid reclaimed accounting");
         }
+        finally { gate.Exit(); }
     }
 
     void Unlink(Node node)

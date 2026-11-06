@@ -18,12 +18,15 @@ static class CostStudy
             return score != 0 ? score : a.Key.AsSpan().SequenceCompareTo(b.Key);
         }
     }
+    /// <summary>Implementation and gate options of every protocol instance in the benchmarks (MEMBER_* variables).</summary>
+    internal static readonly OwnerOptions Options = OwnerOptions.FromEnvironment();
+
     internal sealed class TreeStore(bool protocol)
     {
         readonly object gate = new();
         readonly Dictionary<byte[], double> dictionary = new(new Owner.Bytes());
         readonly SortedSet<(double Score, byte[] Key)> tree = new(new Order());
-        internal readonly Owner? SnapshotOwner = protocol ? new Owner(borrowKeys: true) : null;
+        internal readonly ISnapshotOwner? SnapshotOwner = protocol ? OwnerFactory.Create(Options, borrowKeys: true) : null;
         internal void Set(byte[] key, double score)
         {
             lock (gate)
@@ -75,7 +78,7 @@ static class CostStudy
         }
         if (kind is "owner-copy" or "owner-share")
         {
-            var owner = new Owner(borrowKeys: kind == "owner-share");
+            var owner = OwnerFactory.Create(Options, borrowKeys: kind == "owner-share");
             foreach (var key in keys) owner.Set(key, 0);
             return owner;
         }
@@ -93,7 +96,7 @@ static class CostStudy
         long initialization = GC.GetAllocatedBytesForCurrentThread() - allocated;
         long retained = Heap() - before;
         long snapshot = 0, deleted = 0, afterClose = 0;
-        if (root is Owner owner)
+        if (root is ISnapshotOwner owner)
         {
             var view = owner.Begin();
             snapshot = Heap() - before;
@@ -104,7 +107,7 @@ static class CostStudy
             afterClose = Heap() - before;
             GC.KeepAlive(view);
         }
-        Console.WriteLine(JsonSerializer.Serialize(new { kind, count, length, initialization, retained,
+        Console.WriteLine(JsonSerializer.Serialize(new { kind, impl = Options.Impl, count, length, initialization, retained,
             snapshot, deleted, afterClose, peakWorkingSet = Process.GetCurrentProcess().PeakWorkingSet64 }));
         GC.KeepAlive(root); GC.KeepAlive(keyRoot);
     }

@@ -16,9 +16,10 @@ static class Program
         throw new Exception("Expected rejection");
     }
 
-    static void Tests()
+    static void Tests(OwnerOptions options)
     {
-        var owner = new Owner();
+        ISnapshotOwner New(int maxSlots = 2_000_000, long maxKeyBytes = 128L << 20) => OwnerFactory.Create(options, maxSlots, maxKeyBytes);
+        var owner = New();
         var model = new Dictionary<string, double>();
         void Set(int i, double score) { owner.Set(Key(i), score); model[Name(Key(i))] = score; }
         void Remove(int i) { owner.Remove(Key(i)); model.Remove(Name(Key(i))); }
@@ -67,7 +68,7 @@ static class Program
         Check(recovered == model.Count, "Retry after abort");
         owner.Close(retry);
 
-        var bounded = new Owner(maxSlots: 2, maxKeyBytes: 32);
+        var bounded = New(maxSlots: 2, maxKeyBytes: 32);
         var input = Key(1);
         bounded.Set(input, 1);
         input[0] = 0; // owner owns a copy
@@ -80,17 +81,18 @@ static class Program
         bounded.Close(snap);
         Check(bounded.Slots == 1 && saved[0].Score == 1, "Batch lifetime");
         bounded.Set(Key(2), 3);
-        var empty = new Owner();
+        var empty = New();
         var emptyView = empty.Begin(); empty.Set(Key(1), 1);
         Check(empty.Done(emptyView) && emptyView.Count == 0, "Empty boundary"); empty.Close(emptyView);
-        var payloadBound = new Owner(maxKeyBytes: 1);
+        var payloadBound = New(maxKeyBytes: 1);
         Reject(() => payloadBound.Set(Key(0), 0));
         Check(payloadBound.Count == 0, "Payload budget");
         for (int seed = 0; seed < 100; seed++)
         {
             var random = new Random(seed);
-            var subject = new Owner();
+            var subject = New();
             var reference = new Dictionary<string, double>();
+            var reused = new List<Owner.Row>();  // alternate Read and ReadInto: a reused batch list must not leak rows
             for (int generation = 0; generation < 3; generation++)
             {
                 for (int i = 0; i < 50; i++)
@@ -113,8 +115,13 @@ static class Program
                         subject.Set(Key(id), step); reference[Name(Key(id))] = step;
                     }
                     if (random.Next(5) == 0)
-                        foreach (var row in subject.Read(v, random.Next(1, 5)))
+                    {
+                        List<Owner.Row> rows;
+                        if (random.Next(2) == 0) rows = subject.Read(v, random.Next(1, 5));
+                        else { subject.ReadInto(v, reused, random.Next(1, 5)); rows = reused; }
+                        foreach (var row in rows)
                             Check(output.TryAdd(Name(row.Key), row.Score), "Seeded duplicate");
+                    }
                 }
                 while (!subject.Done(v))
                     foreach (var row in subject.Read(v, 3))
@@ -125,8 +132,8 @@ static class Program
                 Check(subject.Slots == subject.Count, "Seeded reclamation");
             }
         }
-        Console.WriteLine("PASS: 4 snapshots, ordered two-task interleavings, update/delete/reinsert/growth, abort/retry, ownership, budgets, reclamation");
-        Console.WriteLine("PASS: 100 fixed seeds x 3 generations x 200 mutation/scan steps against full reference model");
+        Console.WriteLine($"PASS [{options}]: 4 snapshots, ordered two-task interleavings, update/delete/reinsert/growth, abort/retry, ownership, budgets, reclamation");
+        Console.WriteLine($"PASS [{options}]: 100 fixed seeds x 3 generations x 200 mutation/scan steps against full reference model");
     }
 
     static double Ns(long ticks, int n) => ticks * (1e9 / Stopwatch.Frequency) / n;
@@ -206,13 +213,16 @@ static class Program
                 args.Length == 6 ? int.Parse(args[4]) : 1_000_000, args.Length == 6 ? int.Parse(args[5]) : 200_000);
             return;
         }
+        // Correctness runs on every implementation and gate mode.
+        OwnerOptions[] all = [new("object"), new("object", WriterPriority: true), new("array"), new("array", WriterPriority: true)];
         if (args.SequenceEqual(new[] { "--stress-only" }))
         {
-            ConcurrentStress.Run();
+            foreach (var options in all) ConcurrentStress.Run(options);
             return;
         }
-        Tests();
-        ConcurrentStress.Run();
+        foreach (var options in all) Tests(options);
+        foreach (var options in all) ConcurrentStress.Run(options);
+        if (args.SequenceEqual(new[] { "--tests-only" })) return;
         Console.WriteLine("members,coverage,baseline_init_alloc_bytes,owner_init_alloc_bytes,extra_init_alloc_per_member,baseline_heap_delta,owner_heap_delta,extra_heap_per_member,baseline_update_ns,owner_normal_update_ns,owner_snapshot_update_ns,captures,capture_ns,set_gate_hold_ns,set_gate_wait_ns,scan_ns_per_member");
         Bench(1000, 10000); // warmup; retain separately from larger measurements
         Bench(100000, 200000);

@@ -4,9 +4,9 @@ using System.Text.Json;
 
 namespace MemberProtocol;
 
-// Sustained insert/delete churn: does the Owner's extra per-member object make GC more frequent or its pauses longer?
+// Sustained insert/delete churn: does the protocol's per-member state make GC more frequent or its pauses longer?
 // Variants: "baseline" (dictionary+tree), "owner" (Owner+tree), "scan1" (Owner+tree, one scan started mid-run),
-// "scan1warm" (as scan1, with the scan code run once beforehand on a separate store).
+// "scan1warm" (as scan1, after OwnerFactory.WarmUpScanPath). Implementation and gate options come from MEMBER_* variables.
 // Only Execute is timed: a GC triggered by allocating the fresh member in Prepare pauses outside every timed interval.
 // All variants execute the identical operation sequence: a fixed seed chooses which live member to delete, every
 // delete is followed by an insert of a fresh member, so the live member count stays at `count`.
@@ -61,22 +61,14 @@ static class ChurnDiag
         }
 
         for (int i = 0; i < warmup; i++) Execute(Prepare(i));
-        if (variant == "scan1warm")
-        {
-            var warm = new CostStudy.TreeStore(protocol: true);
-            foreach (var key in CostStudy.Keys(1000, length)) warm.Set(key, 0);
-            var owner = warm.SnapshotOwner!;
-            var view = owner.Begin();
-            try { while (!owner.Done(view)) _ = owner.Read(view); }
-            finally { owner.Close(view); }
-        }
+        if (variant == "scan1warm") OwnerFactory.WarmUpScanPath(CostStudy.Options);
         GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
         GC.WaitForPendingFinalizers();
         GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
 
         using var go = new ManualResetEventSlim();
         long scanStartTicks = 0, scanEndTicks = 0;
-        Owner.View? scanView = null;
+        SnapshotView? scanView = null;
         Task? scanner = null;
         if (scanning)
             scanner = Task.Factory.StartNew(() =>
@@ -85,8 +77,7 @@ static class ChurnDiag
                 var owner = store.SnapshotOwner!;
                 scanStartTicks = Stopwatch.GetTimestamp();
                 var view = scanView = owner.Begin();
-                try { while (!owner.Done(view)) { _ = owner.Read(view); Thread.Yield(); } }
-                finally { owner.Close(view); }
+                OwnerFactory.Drain(owner, view, CostStudy.Options);
                 scanEndTicks = Stopwatch.GetTimestamp();
             }, TaskCreationOptions.LongRunning);
 
@@ -182,6 +173,7 @@ static class ChurnDiag
                 gcConfiguration = GC.GetConfigurationVariables().ToDictionary(kv => kv.Key, kv => kv.Value.ToString()),
                 tieredCompilation = Environment.GetEnvironmentVariable("DOTNET_TieredCompilation") ?? "(unset)",
                 numa = Environment.GetEnvironmentVariable("CHURN_NUMA") ?? "(not recorded)",
+                member = CostStudy.Options,
             },
             completedOperations = operations,
             elapsedMs = Us(runEnd - runStart) / 1000,
