@@ -142,7 +142,7 @@ namespace Garnet.server
     public partial class SortedSetObject : GarnetObjectBase
     {
         private readonly SortedSet<(double Score, byte[] Element)> sortedSet;
-        private readonly Dictionary<byte[], double> sortedSetDict;
+        private readonly SortedSetMemberStore sortedSetDict;
 
         // Expiration state for members with a TTL. Both structures are null until the first TTL is set, are allocated
         // together by InitializeExpirationStructures, and are torn back down together by
@@ -170,7 +170,7 @@ namespace Garnet.server
             : base(MemoryUtils.SortedSetOverhead + MemoryUtils.DictionaryOverhead)
         {
             sortedSet = new(SortedSetComparer.Instance);
-            sortedSetDict = new Dictionary<byte[], double>(ByteArrayComparer.Instance);
+            sortedSetDict = new SortedSetMemberStore();
         }
 
         /// <summary>
@@ -180,7 +180,7 @@ namespace Garnet.server
             : base(reader, MemoryUtils.SortedSetOverhead + MemoryUtils.DictionaryOverhead)
         {
             sortedSet = new(SortedSetComparer.Instance);
-            sortedSetDict = new Dictionary<byte[], double>(ByteArrayComparer.Instance);
+            sortedSetDict = new SortedSetMemberStore();
 
             var count = reader.ReadInt32();
             for (var i = 0; i < count; i++)
@@ -240,7 +240,8 @@ namespace Garnet.server
             {
                 if (!HasExpirableItems() || (expirationQueue.TryPeek(out _, out var expiration) && expiration > DateTimeOffset.UtcNow.Ticks))
                 {
-                    return sortedSetDict;
+                    // In member mode the live map is not handed out: callers get a copy, so no write can bypass the store.
+                    return sortedSetDict.PlainDictionary ?? new Dictionary<byte[], double>(sortedSetDict, ByteArrayComparer.Instance);
                 }
 
                 var result = new Dictionary<byte[], double>(ByteArrayComparer.Instance);
