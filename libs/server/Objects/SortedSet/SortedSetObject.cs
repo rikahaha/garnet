@@ -308,6 +308,63 @@ namespace Garnet.server
             Debug.Assert(count == 0);
         }
 
+        // Research prototype (GARNET_SORTEDSET_MEMBER_CHECKPOINT=1): the snapshot view that preserves this object's (v) members
+        // during a checkpoint, while a superseding clone keeps modifying the shared member store. Never copied to clones.
+        private SortedSetMemberStore.View snapshotView;
+
+        /// <inheritdoc />
+        protected override bool TryOpenSnapshotView()
+        {
+            // Member TTLs live in structures shared with clones that the view does not preserve. If this object has none,
+            // a clone that adds one allocates its own (InitializeExpirationStructures), so this object's data is unaffected.
+            if (expirationTimes is not null)
+                return false;
+            var view = sortedSetDict.TryOpenView(this);
+            if (view is null)
+                return false;
+            snapshotView = view;
+            return true;
+        }
+
+        /// <inheritdoc />
+        protected override void WriteSnapshotView(BinaryWriter writer)
+        {
+            var view = snapshotView ?? throw new InvalidOperationException("No open snapshot view");
+            try
+            {
+                // Same format as DoSerialize for an object without member TTLs.
+                base.DoSerialize(writer);
+                writer.Write(view.Count);
+                var rows = new List<(byte[] Key, double Score)>(128);
+                var written = 0;
+                while (!sortedSetDict.Done(view))
+                {
+                    sortedSetDict.ReadInto(view, rows);
+                    foreach (var (key, score) in rows)
+                    {
+                        writer.Write(key.Length);
+                        writer.Write(key);
+                        writer.Write(score);
+                    }
+                    written += rows.Count;
+                }
+                if (written != view.Count)
+                    throw new InvalidOperationException($"Snapshot view wrote {written} members, expected {view.Count}");
+            }
+            finally
+            {
+                CloseSnapshotView();
+            }
+        }
+
+        /// <inheritdoc />
+        protected override void CloseSnapshotView()
+        {
+            var view = System.Threading.Interlocked.Exchange(ref snapshotView, null);
+            if (view is not null)
+                sortedSetDict.Close(view);
+        }
+
         /// <summary>
         /// Add to SortedSet
         /// </summary>

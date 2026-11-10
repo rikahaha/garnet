@@ -15,6 +15,28 @@ namespace Tsavorite.core
         where TAllocator : IAllocator<TStoreFunctions>
     {
         CheckpointPreSerializer preSerializer;
+        bool snapshotViewsBegun;
+
+        /// <summary>Snapshot views may be opened from PREPARE on; CopyUpdates that preserve (v) data start in IN_PROGRESS.</summary>
+        void BeginSnapshotViews()
+        {
+            if (snapshotViewsBegun)
+                return;
+            CheckpointSnapshotViews.Begin();
+            snapshotViewsBegun = true;
+        }
+
+        /// <summary>
+        /// Close the views of this checkpoint and release bytes read from them. Call after the snapshot flush has completed (or
+        /// the checkpoint aborted) and before PERSISTENCE_CALLBACK, from which (v) objects may be modified in place again.
+        /// </summary>
+        void EndSnapshotViews()
+        {
+            if (!snapshotViewsBegun)
+                return;
+            snapshotViewsBegun = false;
+            CheckpointSnapshotViews.End();
+        }
 
         public SnapshotCheckpointSMTask(TsavoriteKV<TStoreFunctions, TAllocator> store, Guid guid)
             : base(store, guid)
@@ -46,6 +68,7 @@ namespace Tsavorite.core
         public override void OnAbort(StateMachineDriver stateMachineDriver, Exception exception)
         {
             StopPreSerializer();
+            EndSnapshotViews();
             base.OnAbort(stateMachineDriver, exception);
         }
 
@@ -65,6 +88,7 @@ namespace Tsavorite.core
                     store._hybridLogCheckpointToken = guid;
                     store.InitializeHybridLogCheckpoint(store._hybridLogCheckpointToken, next.Version);
                     store._hybridLogCheckpoint.info.useSnapshotFile = 1;
+                    BeginSnapshotViews();
                     ObjectLog_OnPrepare();
                     base.GlobalBeforeEnteringState(next, stateMachineDriver);
                     break;
@@ -116,6 +140,7 @@ namespace Tsavorite.core
                     if (CheckpointObjectTrace.Enabled)
                         CheckpointObjectTrace.Mark("ckpt_flushed");
                     StopPreSerializer();
+                    EndSnapshotViews();
 
                     // Set actual FlushedUntil to the latest possible data in main log that is on disk
                     // If we are using a NullDevice then storage tier is not enabled and FlushedUntilAddress may be ReadOnlyAddress; get all records in memory.

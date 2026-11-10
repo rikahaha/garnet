@@ -189,6 +189,36 @@
 4. `SnapshotCheckpointSMTask`：登记、结束与中止时的关闭和状态恢复；
 5. 正确性测试（§10），再上服务器做性能评估。
 
+## 11a. 实现状态（2026-11-10）
+
+已实现第 1–4 步（开关 `GARNET_SORTEDSET_MEMBER_CHECKPOINT=1`，默认关闭）。与上文设计的差异：
+
+- **状态**：实际用三个状态代替 `VIEW_OPEN`/`VIEW_DRAINED` + `superseded` 标志，把"是否被取代"并进状态里，用一次 CAS 决定，
+  避免刷盘结束时读标志与 CopyUpdate 置标志之间的竞争：
+  - `VIEW_OPEN`：CopyUpdate 建立的视图，还没有刷盘在读（对象已被取代）；
+  - `VIEW_FLUSHING`：刷盘对存活对象建立视图并正在读；CopyUpdate 此时 CAS 到下一个状态后**直接继续，不等待**；
+  - `VIEW_FLUSHING_SUPERSEDED`：刷盘正在读已被取代对象的视图。
+- **同一次 checkpoint 中一条记录可能被刷两次**（主日志和快照文件）。所以读视图的刷盘先把数据读成字节，
+  对象已被取代时把字节保留为 `SERIALIZED`，供后续刷盘复用，checkpoint 结束时统一释放；对象未被取代时回到 `REST`。
+- **登记**：`CheckpointSnapshotViews`，PREPARE 开始、进入 PERSISTENCE_CALLBACK 前（及 `OnAbort`）结束。
+  多个库的 checkpoint 时间重叠时共用一个列表，由最后结束的那个统一关闭（只是多占内存，不影响正确性）。
+  FoldOver checkpoint 不登记，因此不建立视图，走原路径。
+- **成员 TTL 不需要物化退回**：有 TTL 结构的对象不建立视图；没有 TTL 结构的对象被取代后，
+  克隆添加 TTL 时分配的是克隆自己的结构，不影响 v 包装。所以第一版没有实现 §7。
+- 非 checkpoint 路径（`IsInNewVersion` 为假的 CopyUpdate）保持原行为，仍等待正在进行的序列化，因为它会释放源对象。
+- 尚未实现：大小阈值与结构转换（§6）、内存计入（§8）、集群迁移路径的核实（§9）。
+
+验证（本地 Mac）：
+
+- `correctness_check.py` 新增场景 C：checkpoint 期间一个客户端持续写（ZADD、改分数、ZINCRBY、ZREM、ZPOPMIN），
+  连续 3 次 checkpoint 后 `kill -9`，不用 AOF 恢复；检查每个集合恰好等于自身操作的某个前缀，且所有前缀来自同一个全局前缀。
+  开关关闭和打开都 PASS；场景 A、B 两种模式都 PASS。
+- 场景 C 的 trace（开关打开）：请求线程整对象序列化 0 次；建立视图 58 次，平均 2.5 µs，最长 97 µs；
+  刷盘先到时 CopyUpdate 不等待 2 次；刷盘读视图 60 次，平均 12.3 ms，每个集合 3.7 MB。
+- 现有测试：SortedSet 351 个（两种模式），Tsavorite recovery 246 个，Tsavorite 对象相关 8 个，全部通过。
+  Garnet checkpoint 相关 100 个测试：两种模式各有 1 个与定时器相关的测试在整组运行时失败（不是同一个），
+  单独重跑都通过（开关打开时 `ScheduledCheckpointRecoversStringAndObjectUpdates` 连续 10 次通过），判断为负载下的偶发失败。
+
 ## 12. 需要决定的问题
 
 1. 阈值 T 的初值，以及是否允许通过配置修改；

@@ -45,6 +45,23 @@ namespace Tsavorite.core
         public bool MakeTransition(SerializationPhase expectedPhase, SerializationPhase nextPhase)
             => Interlocked.CompareExchange(ref serializationPhaseInt, (int)nextPhase, (int)expectedPhase) == (int)expectedPhase;
 
+        /// <summary>
+        /// Research prototype: open an O(1) snapshot view of the object's current data, so that its (v) data can be read later
+        /// while a superseding (v+1) clone keeps modifying the shared internal structures.
+        /// </summary>
+        /// <remarks>Called with the object held in <see cref="SerializationPhase.SERIALIZING"/>. The default supports no views.</remarks>
+        /// <returns>Whether a view was opened.</returns>
+        protected virtual bool TryOpenSnapshotView() => false;
+
+        /// <summary>
+        /// Research prototype: write the data of the open view exactly as <see cref="DoSerialize"/> would have written it when the
+        /// view was opened, and close the view. On an exception the view must be closed as well.
+        /// </summary>
+        protected virtual void WriteSnapshotView(BinaryWriter writer) => throw new System.NotSupportedException();
+
+        /// <summary>Research prototype: close the open view, if any, without writing it.</summary>
+        protected virtual void CloseSnapshotView() { }
+
         /// <inheritdoc />
         public abstract void Dispose();
 
@@ -61,6 +78,15 @@ namespace Tsavorite.core
                 // CopyUpdater does that, as it must ensure the object's (v1) data is not changed during the checkpoint.
                 if (SerializationPhase == SerializationPhase.REST && MakeTransition(SerializationPhase.REST, SerializationPhase.SERIALIZING))
                 {
+                    // During a checkpoint, read a view instead of holding the object for the whole serialization, so that a
+                    // CopyUpdate arriving meanwhile does not wait for this flush.
+                    if (CheckpointSnapshotViews.Active && TryOpenSnapshotView())
+                    {
+                        SerializationPhase = SerializationPhase.VIEW_FLUSHING;
+                        FlushFromView(writer);
+                        return;
+                    }
+
                     if (CheckpointPreSerializer.FlushCapture)
                     {
                         SerializeViaCapture(writer);
@@ -116,6 +142,13 @@ namespace Tsavorite.core
                         // Write null object to stream
                         WriteType(writer, isNull: true);
                     }
+                    return;
+                }
+
+                // A CopyUpdate opened a view of the (v) data and no flush has read it yet: this flush reads it.
+                if (SerializationPhase == SerializationPhase.VIEW_OPEN && MakeTransition(SerializationPhase.VIEW_OPEN, SerializationPhase.VIEW_FLUSHING_SUPERSEDED))
+                {
+                    FlushFromView(writer);
                     return;
                 }
 
@@ -195,6 +228,98 @@ namespace Tsavorite.core
         }
 
         /// <summary>
+        /// Research prototype (snapshot views): read the open view into memory and write it to <paramref name="writer"/>. The view is read
+        /// in batches that let writers of the shared structures through, so a CopyUpdate never waits for this. If the object has been
+        /// superseded by the end, the bytes are kept as <see cref="SerializationPhase.SERIALIZED"/> for later flushes of the same
+        /// checkpoint (the main log and the snapshot file may both flush it); otherwise the object returns to REST.
+        /// </summary>
+        /// <remarks>The caller has moved the object to VIEW_FLUSHING or VIEW_FLUSHING_SUPERSEDED.</remarks>
+        void FlushFromView(BinaryWriter writer)
+        {
+            var traceStart = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
+            var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
+
+            SerializedObjectData data;
+            try
+            {
+                data = SerializedObjectData.Capture(WriteSnapshotView);
+            }
+            catch
+            {
+                try { CloseSnapshotView(); } catch { /* report the original exception */ }
+                // A live object returns to REST. A superseded object has lost its (v) data; it can only write null from now on,
+                // and this exception fails the flush, so the checkpoint does not complete with it.
+                if (!MakeTransition(SerializationPhase.VIEW_FLUSHING, SerializationPhase.REST))
+                    _ = Interlocked.Exchange(ref serializationPhaseInt, (int)SerializationPhase.SERIALIZED);
+                throw;
+            }
+
+            // The view is closed now. Hold a reader reference across the write: once published, the object owns the data.
+            _ = data.TryAcquire();
+            var kept = !MakeTransition(SerializationPhase.VIEW_FLUSHING, SerializationPhase.REST);
+            if (kept)
+            {
+                serializedData = data;
+                _ = Interlocked.Exchange(ref serializationPhaseInt, (int)SerializationPhase.SERIALIZED);
+                if (!CheckpointSnapshotViews.TryRegister(this))
+                    Interlocked.Exchange(ref serializedData, null)?.Release();  // the checkpoint has ended: nobody needs them
+            }
+            var traceRead = CheckpointObjectTrace.Enabled ? CheckpointObjectTrace.Now() : 0;
+
+            try
+            {
+                WriteType(writer, isNull: false);
+                data.WriteTo(writer);
+            }
+            finally
+            {
+                data.Release();
+                if (!kept)
+                    data.Release();
+            }
+
+            if (CheckpointObjectTrace.Enabled)
+            {
+                var end = CheckpointObjectTrace.Now();
+                CheckpointObjectTrace.Record(kept ? "flush_view_kept" : "flush_view", this,
+                    totalUs: CheckpointObjectTrace.Us(traceStart, end), waitUs: 0,
+                    serializeUs: CheckpointObjectTrace.Us(traceStart, traceRead),
+                    writeUs: CheckpointObjectTrace.Us(traceRead, end), traceGc, data.Length);
+            }
+        }
+
+        /// <summary>
+        /// Research prototype (snapshot views): the checkpoints this object was registered with have ended. Close a view that no flush
+        /// read (its (v) data was not needed, e.g. the record was below the snapshot's flush range), and release bytes read from one.
+        /// A flush still reading a view releases its own bytes when it sees no checkpoint in progress.
+        /// </summary>
+        internal void EndSnapshotView()
+        {
+            while (true)
+            {
+                var phase = SerializationPhase;
+                if (phase == SerializationPhase.VIEW_OPEN)
+                {
+                    if (!MakeTransition(SerializationPhase.VIEW_OPEN, SerializationPhase.SERIALIZING))
+                        continue;
+                    try
+                    {
+                        CloseSnapshotView();
+                    }
+                    finally
+                    {
+                        // Superseded, as for a CopyUpdate's bytes after ClearSerializedObjectData: later flushes write null.
+                        SerializationPhase = SerializationPhase.SERIALIZED;
+                    }
+                    return;
+                }
+                if (phase == SerializationPhase.SERIALIZED)
+                    Interlocked.Exchange(ref serializedData, null)?.Release();
+                return;
+            }
+        }
+
+        /// <summary>
         /// Publish <paramref name="data"/> as this object's pre-serialized (v) data. The caller holds the object in SERIALIZING and is
         /// responsible for returning it to REST via <see cref="ResetPreSerialized"/> before the checkpoint ends.
         /// </summary>
@@ -262,6 +387,35 @@ namespace Tsavorite.core
             {
                 if (SerializationPhase == (int)SerializationPhase.REST && MakeTransition(SerializationPhase.REST, SerializationPhase.SERIALIZING))
                 {
+                    // Snapshot views: preserve the (v) data with an O(1) view instead of serializing the whole object here, under
+                    // the record lock, on the request thread. The view is registered so that the end of the checkpoint closes it.
+                    var viewOpened = false;
+                    try
+                    {
+                        if (CheckpointSnapshotViews.Active && TryOpenSnapshotView())
+                        {
+                            if (CheckpointSnapshotViews.TryRegister(this))
+                                viewOpened = true;
+                            else
+                                CloseSnapshotView();
+                        }
+                    }
+                    catch
+                    {
+                        SerializationPhase = SerializationPhase.REST;
+                        throw;
+                    }
+                    if (viewOpened)
+                    {
+                        SerializationPhase = SerializationPhase.VIEW_OPEN;
+                        if (CheckpointObjectTrace.Enabled)
+                        {
+                            var us = CheckpointObjectTrace.Us(traceStart, CheckpointObjectTrace.Now());
+                            CheckpointObjectTrace.Record("cou_view", this, us, 0, us, 0, traceGc, 0);
+                        }
+                        return;
+                    }
+
                     try
                     {
                         if (CheckpointObjectTrace.Enabled)
@@ -287,6 +441,14 @@ namespace Tsavorite.core
                 // 1. CopyUpdate has been called before and the state is .SERIALIZED and '_serialized' is created. We're done.
                 // 2. Serialize() is running (likely in a Flush()) and the state is .SERIALIZING. We will Yield and loop to wait for it to finish.
                 if (SerializationPhase >= SerializationPhase.SERIALIZED)
+                    break;
+
+                // Snapshot views: a flush is reading a view of this object. Mark it superseded, so that the flush keeps the (v) bytes,
+                // and go on without waiting for the flush. (VIEW_OPEN and VIEW_FLUSHING_SUPERSEDED mean it was already superseded.)
+                if (SerializationPhase == SerializationPhase.VIEW_FLUSHING
+                        && MakeTransition(SerializationPhase.VIEW_FLUSHING, SerializationPhase.VIEW_FLUSHING_SUPERSEDED))
+                    break;
+                if (SerializationPhase is SerializationPhase.VIEW_OPEN or SerializationPhase.VIEW_FLUSHING_SUPERSEDED)
                     break;
 
                 // 3. The checkpoint pre-serialized the (v) data; adopt those bytes as this CopyUpdate's capture.

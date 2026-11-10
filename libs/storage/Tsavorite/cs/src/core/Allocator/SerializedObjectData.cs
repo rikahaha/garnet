@@ -46,20 +46,24 @@ namespace Tsavorite.core
         }
 
         /// <summary>Serialize <paramref name="heapObject"/>, without its type header.</summary>
-        public static SerializedObjectData Capture(HeapObjectBase heapObject)
+        public static SerializedObjectData Capture(HeapObjectBase heapObject) => Capture(heapObject.DoSerialize);
+
+        /// <summary>Capture what <paramref name="write"/> writes.</summary>
+        public static SerializedObjectData Capture(System.Action<BinaryWriter> write)
         {
             if (!Pooled)
             {
                 using var ms = new MemoryStream();
                 using var msWriter = new BinaryWriter(ms, Encoding.UTF8);
-                heapObject.DoSerialize(msWriter);
+                write(msWriter);
+                msWriter.Flush();
                 var bytes = ms.ToArray();
                 return new SerializedObjectData([bytes], bytes.Length, bytes.Length, pooled: false);
             }
 
             using var stream = new ChunkWriteStream();
             using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
-                heapObject.DoSerialize(writer);
+                write(writer);
             return stream.Detach();
         }
 

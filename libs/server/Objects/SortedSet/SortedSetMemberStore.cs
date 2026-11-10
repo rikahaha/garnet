@@ -26,6 +26,13 @@ namespace Garnet.server
         /// <summary>Whether new stores use member mode.</summary>
         public static readonly bool MemberMode = Environment.GetEnvironmentVariable("GARNET_SORTEDSET_MEMBER_CHECKPOINT") == "1";
 
+        // Compile the reader paths before the first checkpoint, so its first batch does not JIT-compile while holding the gate.
+        static SortedSetMemberStore()
+        {
+            if (MemberMode)
+                WarmUp();
+        }
+
         const int SegmentShift = 12, SegmentSize = 1 << SegmentShift, SegmentMask = SegmentSize - 1;
         const int None = -1;
         const byte LiveFlag = 1, HasOldFlag = 2;
