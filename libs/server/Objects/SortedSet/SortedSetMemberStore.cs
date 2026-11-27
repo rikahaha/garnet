@@ -45,6 +45,7 @@ namespace Garnet.server
             internal readonly double[] Scores = new double[SegmentSize], OldScores = new double[SegmentSize];
             internal readonly int[] Prev = new int[SegmentSize], Next = new int[SegmentSize];
             internal readonly byte[] Flags = new byte[SegmentSize];
+            internal readonly int[] ModEpochs = new int[SegmentSize], OldModEpochs = new int[SegmentSize];
         }
 
         /// <summary>A snapshot view: the boundary and the reader's cursor.</summary>
@@ -55,14 +56,26 @@ namespace Garnet.server
             internal int Cursor;
             internal bool Closed;
 
+            /// <summary>Change epoch at the boundary: members last changed at or before it are in the view.</summary>
+            internal readonly int Epoch;
+
+            /// <summary>Epoch of the base this view would be a delta against; 0 if there is none.</summary>
+            public int BaseEpoch { get; }
+
+            /// <summary>Members that existed at the base and were deleted before the boundary (delta estimate).</summary>
+            public long DeletedSinceBase { get; internal set; }
+
+            /// <summary>Key bytes of <see cref="DeletedSinceBase"/>.</summary>
+            public long DeletedKeyBytesSinceBase { get; internal set; }
+
             /// <summary>Number of members at the boundary.</summary>
             public int Count { get; }
 
             /// <summary>The object that opened the view, so a writer that cannot proceed under the view can materialize it.</summary>
             public object Owner { get; }
 
-            internal View(SortedSetMemberStore source, long limit, int count, int cursor, object owner)
-                => (Source, Limit, Count, Cursor, Owner) = (source, limit, count, cursor, owner);
+            internal View(SortedSetMemberStore source, long limit, int count, int cursor, object owner, int epoch, int baseEpoch)
+                => (Source, Limit, Count, Cursor, Owner, Epoch, BaseEpoch) = (source, limit, count, cursor, owner, epoch, baseEpoch);
         }
 
         readonly Dictionary<byte[], double> plain;
@@ -76,6 +89,13 @@ namespace Garnet.server
         long writerAcquisitions, lastId;
         View active;
 
+        // Change tracking for the incremental-checkpoint estimate (ckpt-delta, step 1). Each opened view ends an epoch; every
+        // write stamps the member with the current epoch. The base is the last view read to the end, assuming its checkpoint
+        // completed. Deletes of members that existed at the last opened boundary are counted per epoch.
+        int epoch = 1, baseEpoch;
+        long lastViewLimit;
+        readonly List<(int Epoch, long Count, long KeyBytes)> deletes;
+
         /// <summary>Create an empty store in the configured mode.</summary>
         public SortedSetMemberStore() : this(MemberMode) { }
 
@@ -87,6 +107,7 @@ namespace Garnet.server
                 live = new Dictionary<byte[], int>(ByteArrayComparer.Instance);
                 segments = new List<Segment>();
                 gate = new object();
+                deletes = new List<(int, long, long)>();
             }
             else
                 plain = new Dictionary<byte[], double>(ByteArrayComparer.Instance);
@@ -159,6 +180,8 @@ namespace Garnet.server
                 }
                 score = Score(slot);
                 Capture(slot);
+                if (Id(slot) <= lastViewLimit)
+                    CountDelete(key.Length);
                 _ = live.Remove(key);
                 Flags(slot) &= unchecked((byte)~LiveFlag);
                 if (!Pending(slot)) Release(slot);
@@ -192,16 +215,28 @@ namespace Garnet.server
             lock (gate)
             {
                 if (active is not null) return null;
-                var view = new View(this, lastId, live.Count, head, owner);
+                var view = new View(this, lastId, live.Count, head, owner, epoch, baseEpoch);
+                foreach (var d in deletes)
+                {
+                    if (d.Epoch > baseEpoch && d.Epoch <= epoch)
+                    {
+                        view.DeletedSinceBase += d.Count;
+                        view.DeletedKeyBytesSinceBase += d.KeyBytes;
+                    }
+                }
+                epoch++;
+                lastViewLimit = lastId;
                 Volatile.Write(ref active, view);
                 return view;
             }
         }
 
         /// <summary>Read up to <paramref name="maxMembers"/> boundary members into <paramref name="rows"/> (cleared first).</summary>
-        public void ReadInto(View view, List<(byte[] Key, double Score)> rows, int maxMembers = 128)
+        /// <param name="changed">If not null, cleared and filled with whether each row changed since the view's base.</param>
+        public void ReadInto(View view, List<(byte[] Key, double Score)> rows, int maxMembers = 128, List<bool> changed = null)
         {
             rows.Clear();
+            changed?.Clear();
             EnterReader();
             try
             {
@@ -210,7 +245,9 @@ namespace Garnet.server
                 {
                     var slot = view.Cursor;
                     var flags = Flags(slot);
-                    rows.Add((Key(slot), (flags & HasOldFlag) != 0 ? OldScore(slot) : Score(slot)));
+                    var hasOld = (flags & HasOldFlag) != 0;
+                    rows.Add((Key(slot), hasOld ? OldScore(slot) : Score(slot)));
+                    changed?.Add((hasOld ? OldModEpoch(slot) : ModEpoch(slot)) > view.BaseEpoch);
                     view.Cursor = Next(slot);  // read before Release clears the links
                     Flags(slot) = (byte)(flags & ~HasOldFlag);
                     if ((flags & LiveFlag) == 0) Release(slot);
@@ -227,6 +264,17 @@ namespace Garnet.server
             EnterReader();
             try { Validate(view); return view.Cursor == None; }
             finally { Monitor.Exit(gate); }
+        }
+
+        /// <summary>The view was read to the end and written: make it the base for the next delta estimate.</summary>
+        public void CommitBase(View view)
+        {
+            lock (gate)
+            {
+                Validate(view);
+                baseEpoch = view.Epoch;
+                _ = deletes.RemoveAll(d => d.Epoch <= baseEpoch);
+            }
         }
 
         /// <summary>Drain what the reader has not read, releasing retained members and old scores, and close the view.</summary>
@@ -252,6 +300,19 @@ namespace Garnet.server
         ref int Prev(int slot) => ref Seg(slot).Prev[slot & SegmentMask];
         ref int Next(int slot) => ref Seg(slot).Next[slot & SegmentMask];
         ref byte Flags(int slot) => ref Seg(slot).Flags[slot & SegmentMask];
+        ref int ModEpoch(int slot) => ref Seg(slot).ModEpochs[slot & SegmentMask];
+        ref int OldModEpoch(int slot) => ref Seg(slot).OldModEpochs[slot & SegmentMask];
+
+        void CountDelete(int keyBytes)
+        {
+            if (deletes.Count > 0 && deletes[^1].Epoch == epoch)
+            {
+                var last = deletes[^1];
+                deletes[^1] = (epoch, last.Count + 1, last.KeyBytes + keyBytes);
+            }
+            else
+                deletes.Add((epoch, 1, keyBytes));
+        }
 
         void Set(byte[] key, double score, bool mustAdd)
         {
@@ -263,6 +324,7 @@ namespace Garnet.server
                     if (mustAdd) throw new ArgumentException("An item with the same key has already been added.");
                     Capture(slot);
                     Score(slot) = score;
+                    ModEpoch(slot) = epoch;
                     return;
                 }
                 var id = checked(lastId + 1);
@@ -272,6 +334,7 @@ namespace Garnet.server
                 Key(slot) = key;
                 Id(slot) = id;
                 Score(slot) = score;
+                ModEpoch(slot) = epoch;
                 Flags(slot) = LiveFlag;
                 Prev(slot) = tail;
                 Next(slot) = None;
@@ -289,6 +352,7 @@ namespace Garnet.server
         {
             if (!Pending(slot) || (Flags(slot) & HasOldFlag) != 0) return;
             OldScore(slot) = Score(slot);
+            OldModEpoch(slot) = ModEpoch(slot);
             Flags(slot) |= HasOldFlag;
         }
 

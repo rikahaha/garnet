@@ -336,20 +336,42 @@ namespace Garnet.server
                 base.DoSerialize(writer);
                 writer.Write(view.Count);
                 var rows = new List<(byte[] Key, double Score)>(128);
+                var changed = SortedSetDeltaTrace.Enabled ? new List<bool>(128) : null;
                 var written = 0;
+                long fullBytes = sizeof(int), changedCount = 0, changedBytes = 0;
                 while (!sortedSetDict.Done(view))
                 {
-                    sortedSetDict.ReadInto(view, rows);
-                    foreach (var (key, score) in rows)
+                    sortedSetDict.ReadInto(view, rows, changed: changed);
+                    for (var i = 0; i < rows.Count; i++)
                     {
+                        var (key, score) = rows[i];
                         writer.Write(key.Length);
                         writer.Write(key);
                         writer.Write(score);
+                        if (changed is not null)
+                        {
+                            var rowBytes = sizeof(int) + key.Length + sizeof(double);
+                            fullBytes += rowBytes;
+                            if (changed[i])
+                            {
+                                changedCount++;
+                                changedBytes += rowBytes;
+                            }
+                        }
                     }
                     written += rows.Count;
                 }
                 if (written != view.Count)
                     throw new InvalidOperationException($"Snapshot view wrote {written} members, expected {view.Count}");
+                if (changed is not null)
+                {
+                    // Delta = changed or added rows, plus deleted keys (length + key), plus two counts. No base: a full write.
+                    var deltaBytes = view.BaseEpoch == 0 ? fullBytes
+                        : 2 * sizeof(int) + changedBytes + view.DeletedSinceBase * sizeof(int) + view.DeletedKeyBytesSinceBase;
+                    SortedSetDeltaTrace.Record(sortedSetDict, view.Count, changedCount, view.DeletedSinceBase, view.BaseEpoch, fullBytes, deltaBytes);
+                }
+                // Assume this checkpoint completes: the next view's delta is against this one.
+                sortedSetDict.CommitBase(view);
             }
             finally
             {
