@@ -1,6 +1,6 @@
 # 成员级增量 checkpoint：设计（方案 B）
 
-分支 `ckpt-delta`。第 1 步（差量大小估计）见 `results_local/RESULTS.md`。本文是第 2 步（真正写差量、恢复）的设计，还没实现。
+分支 `ckpt-delta`。第 1 步（差量大小估计）见 `results_local/RESULTS.md`。本文是第 2 步（真正写差量、恢复）的设计；实现状态见文末。
 
 ## 目标
 
@@ -90,3 +90,32 @@
 
 - 本地：改动比例 0.1%–50% 和 Zipf 负载下，checkpoint 写出字节数、checkpoint 时长、恢复时间（随链长）、侧存储占用。
 - cygnus（照例先给计划）：吞吐量实验加上增量配置，对比 checkpoint 时长和 checkpoint 期间吞吐量。
+
+## 实现状态（2026-11-27）
+
+已实现，开关 `GARNET_SORTEDSET_DELTA=1`（需同时打开 `GARNET_SORTEDSET_MEMBER_CHECKPOINT=1`），阈值 `GARNET_SORTEDSET_DELTA_MIN`（默认 10000）。
+
+| 位置 | 内容 |
+| --- | --- |
+| `Tsavorite/.../ObjectAllocatorImpl.cs` | Snapshot 刷盘序列化对象时设置 `HeapObjectBase.InSnapshotFlush` |
+| `Tsavorite/.../HeapObjectBase.cs` | `WriteSnapshotView` 返回"是否只对快照有效"；这种 kept 字节在其他刷盘中写 null |
+| `server/Objects/SortedSet/SortedSetSideStore.cs`（新） | 链文件格式、写入并 fsync、按链读回并校验、清理 |
+| `server/Objects/SortedSet/SortedSetMemberStore.cs` | 存储 uid、链状态（BaseSeq / ChainStart / ChainDeltas）、每轮被改成员计数、被删 key（有上限，超出则丢弃 base） |
+| `server/Objects/SortedSet/SortedSetObject.cs` | 写快照：大集合写链文件 + 存根，其余内联；构造时读到存根就从侧存储读回 |
+| `server/StoreWrapper.cs`、`Databases/DatabaseManagerBase.cs` | 配置目录；checkpoint 完成后、恢复后清理；其他数据库做 checkpoint 时停止写存根 |
+
+与设计的差异：
+
+- 多数据库：Garnet 默认允许多个数据库，所以不是"有多数据库就不写"，而是"一旦有非 0 号数据库做 checkpoint，就停止写存根"。
+- 小集合写进快照时（内联），链状态清零，下一次链文件必须是完整版本。
+
+测试：
+
+- 单元（`test/standalone/Garnet.test.collections/SortedSetSideStoreTests.cs`，7 个）：链的写读、删了又加、缺文件 / 损坏 / 截断 / 别的 uid 的文件都抛异常、未提交的文件被删、清理规则。
+- 端到端（`delta_correctness.py`）：chain（7 次 checkpoint，写入不停，kill -9，前缀一致；链在 4 个差量后被完整文件截断；清理后每个集合只剩当前链）、
+  restart（DEL 后重建、恢复后第一次写完整、再写差量、再恢复）、crash（checkpoint 进行中 kill -9 共 8 次，恢复结果总是上一次或进行中那一次）、
+  aof（checkpoint + AOF 重放）。全部通过。
+- 回归：成员 + 增量模式、阈值 1（所有 SortedSet 都走侧存储）下 `Garnet.test.collections` 的 SortedSet 测试 358 个全部通过。
+- 回归：`Garnet.test.collections` 全部 853 个，增量开（阈值 1）和全关两种模式都通过。`Garnet.test`（排除 `MultiTcpSocketTest`）两种模式都是
+  1533 通过、同样 4 个失败（`PinnedBasePortThatIsOccupiedFails`、`ListenerIsDetectedOnEveryBoundAddressKind` ×3，本机端口占用检测相关，与开关无关）。
+  `MultiTcpSocketTest` 在本机连 IPv6 链路本地地址失败，且失败后不关闭服务器，连带后续测试绑不上端口，所以单独排除。

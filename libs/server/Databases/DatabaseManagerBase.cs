@@ -171,6 +171,8 @@ namespace Garnet.server
         {
             var storeVersion = await db.Store.RecoverAsync().ConfigureAwait(false);
             Logger?.LogInformation("Recovered store to version {storeVersion}", storeVersion);
+            if (db.Id == 0)
+                SortedSetSideStore.OnRecoveryCompleted();
 
             db.CheckpointRecovery = new CheckpointRecoveryOutcome { StoreVersion = storeVersion };
 
@@ -263,8 +265,16 @@ namespace Garnet.server
                            lastSaveStoreTailAddress - db.LastSaveStoreTailAddress >= StoreWrapper.serverOptions.FullCheckpointLogInterval;
 
                 var checkpointType = StoreWrapper.serverOptions.UseFoldOverCheckpoints ? CheckpointType.FoldOver : CheckpointType.Snapshot;
+
+                // Research prototype (ckpt-delta): the side store serves DB 0 only.
+                if (db.Id != 0)
+                    SortedSetSideStore.DisableWrites();
                 if (!await InitiateCheckpointAsync(db, full, checkpointType, logger).ConfigureAwait(false))
                     return CheckpointResult.Failed;
+
+                // Research prototype (ckpt-delta): the completed checkpoint is now the only one kept; drop side store chains it does not use.
+                if (db.Id == 0)
+                    SortedSetSideStore.OnCheckpointCompleted();
 
                 return CheckpointResult.Succeeded(full ? lastSaveStoreTailAddress : null);
             }

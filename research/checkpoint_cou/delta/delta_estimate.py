@@ -105,6 +105,7 @@ def main():
             time.sleep(0.2)
             rows = list(csv.DictReader(open(trace)))[seen:]
             seen += len(rows)
+            rows = [r for r in rows if r.get("written", "inline") == "inline"]  # snapshot writes only, not main-log flushes
             assert len(rows) == SETS, f"{wl}: expected {SETS} trace rows, got {len(rows)}"
             got = sorted((int(r["changed"]), int(r["deleted"])) for r in rows)
             want = sorted(expect.values())

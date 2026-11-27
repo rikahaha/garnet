@@ -28,6 +28,20 @@ namespace Tsavorite.core
         /// <summary>The internal serialized (v) data of the object, cached during a checkpoint.</summary>
         SerializedObjectData serializedData;
 
+        /// <summary>Research prototype (delta checkpoints): <see cref="serializedData"/> was written for the snapshot file only (e.g. it
+        /// references data stored outside the log), so a flush to any other target must not reuse it.</summary>
+        bool serializedDataSnapshotOnly;
+
+        [System.ThreadStatic]
+        static bool inSnapshotFlush;
+
+        /// <summary>Research prototype (delta checkpoints): whether the current thread is serializing objects into a snapshot checkpoint
+        /// file, as opposed to the main log. Only snapshot files may hold data that refers to storage outside the log.</summary>
+        public static bool InSnapshotFlush => inSnapshotFlush;
+
+        /// <summary>Set by the allocator around object serialization for a snapshot checkpoint flush.</summary>
+        internal static void SetSnapshotFlush(bool value) => inSnapshotFlush = value;
+
         /// <summary>
         /// Create a cloned (shallow copy) of this object
         /// </summary>
@@ -54,10 +68,12 @@ namespace Tsavorite.core
         protected virtual bool TryOpenSnapshotView() => false;
 
         /// <summary>
-        /// Research prototype: write the data of the open view exactly as <see cref="DoSerialize"/> would have written it when the
-        /// view was opened, and close the view. On an exception the view must be closed as well.
+        /// Research prototype: write the data of the open view as of when the view was opened, and close the view. On an exception the
+        /// view must be closed as well. Outside a snapshot flush (<see cref="InSnapshotFlush"/>) it must write exactly what
+        /// <see cref="DoSerialize"/> would have written; in a snapshot flush it may instead write a form only valid in the snapshot file.
         /// </summary>
-        protected virtual void WriteSnapshotView(BinaryWriter writer) => throw new System.NotSupportedException();
+        /// <returns>True if what was written is only valid in the snapshot file.</returns>
+        protected virtual bool WriteSnapshotView(BinaryWriter writer) => throw new System.NotSupportedException();
 
         /// <summary>Research prototype: close the open view, if any, without writing it.</summary>
         protected virtual void CloseSnapshotView() { }
@@ -124,7 +140,11 @@ namespace Tsavorite.core
                 if (SerializationPhase == SerializationPhase.SERIALIZED)
                 {
                     // If serialized state is cached, use that. Data released under us was cleared after the checkpoint, the same as null.
+                    // Bytes valid only in a snapshot file are not written elsewhere: this object is superseded, so its record is not reachable,
+                    // and the checkpoint recovers it from the snapshot file; write null as after the checkpoint.
                     var _serialized = serializedData;
+                    if (serializedDataSnapshotOnly && !inSnapshotFlush)
+                        _serialized = null;
                     if (_serialized != null && _serialized.TryAcquire())
                     {
                         try
@@ -240,9 +260,10 @@ namespace Tsavorite.core
             var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
 
             SerializedObjectData data;
+            var snapshotOnly = false;
             try
             {
-                data = SerializedObjectData.Capture(WriteSnapshotView);
+                data = SerializedObjectData.Capture(w => snapshotOnly = WriteSnapshotView(w));
             }
             catch
             {
@@ -259,6 +280,7 @@ namespace Tsavorite.core
             var kept = !MakeTransition(SerializationPhase.VIEW_FLUSHING, SerializationPhase.REST);
             if (kept)
             {
+                serializedDataSnapshotOnly = snapshotOnly;
                 serializedData = data;
                 _ = Interlocked.Exchange(ref serializationPhaseInt, (int)SerializationPhase.SERIALIZED);
                 if (!CheckpointSnapshotViews.TryRegister(this))
@@ -325,6 +347,7 @@ namespace Tsavorite.core
         /// </summary>
         internal void PublishPreSerialized(SerializedObjectData data)
         {
+            serializedDataSnapshotOnly = false;
             serializedData = data;
             SerializationPhase = SerializationPhase.PRESERIALIZED;
         }
@@ -420,6 +443,7 @@ namespace Tsavorite.core
                     {
                         if (CheckpointObjectTrace.Enabled)
                             traceSerializeStart = CheckpointObjectTrace.Now();
+                        serializedDataSnapshotOnly = false;
                         serializedData = SerializedObjectData.Capture(this);
                         if (CheckpointObjectTrace.Enabled)
                             traceSerializeEnd = CheckpointObjectTrace.Now();
@@ -489,6 +513,7 @@ namespace Tsavorite.core
             var traceGc = CheckpointObjectTrace.Enabled ? System.GC.GetTotalPauseDuration() : default;
             try
             {
+                serializedDataSnapshotOnly = false;
                 serializedData = SerializedObjectData.Capture(this);
             }
             catch

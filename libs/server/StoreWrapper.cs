@@ -204,6 +204,11 @@ namespace Garnet.server
             this.servers = servers;
             this.startupTimestamp = Stopwatch.GetTimestamp();
             this.serverOptions = serverOptions;
+            // Research prototype (ckpt-delta): where sorted set checkpoint stubs point (DB 0's checkpoint directory). Not in cluster mode;
+            // writing stops once another database is checkpointed. Stubs are read whenever a recovered snapshot contains them.
+            if (!serverOptions.EnableCluster)
+                SortedSetSideStore.Configure(System.IO.Path.Combine(serverOptions.GetStoreCheckpointDirectory(0), "sortedset-members"),
+                    allowWrite: true);
             // Share the runtime config table across cloned wrappers (e.g. the AOF copy ctor) so that a
             // CONFIG SET is observed consistently; otherwise seed a fresh table from the startup options.
             // A freshly created table is bound to this wrapper as its owner so update actions can enact

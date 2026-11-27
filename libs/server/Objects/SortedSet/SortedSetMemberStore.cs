@@ -68,6 +68,14 @@ namespace Garnet.server
             /// <summary>Key bytes of <see cref="DeletedSinceBase"/>.</summary>
             public long DeletedKeyBytesSinceBase { get; internal set; }
 
+            /// <summary>Upper bound on the members changed or added since the base (exact when the base is the previous epoch).</summary>
+            public long ChangedSinceBase { get; internal set; }
+
+            /// <summary>Keys deleted since the base, of members that may have existed at the base (delta mode only; else null).</summary>
+            public List<byte[]> DeletedKeysSinceBase { get; internal set; }
+
+            internal int ChainGeneration;
+
             /// <summary>Number of members at the boundary.</summary>
             public int Count { get; }
 
@@ -95,6 +103,24 @@ namespace Garnet.server
         int epoch = 1, baseEpoch;
         long lastViewLimit;
         readonly List<(int Epoch, long Count, long KeyBytes)> deletes;
+        readonly List<(int Epoch, long Count)> changes;
+        readonly List<(int Epoch, byte[] Key)> deletedKeys;  // delta mode only
+
+        /// <summary>Random id of this store, naming its chain in the side store.</summary>
+        public long Uid { get; } = Random.Shared.NextInt64(1, long.MaxValue);
+
+        /// <summary>Sequence number of the last chain file written, its chain's full file, and deltas since that full file
+        /// (side store chain state; changed only by the snapshot flush that holds this store's view).</summary>
+        public long BaseSeq { get; private set; }
+
+        /// <summary>The full file of the chain ending at <see cref="BaseSeq"/>.</summary>
+        public long ChainStart { get; private set; }
+
+        /// <summary>Deltas in the chain ending at <see cref="BaseSeq"/>.</summary>
+        public int ChainDeltas { get; private set; }
+
+        // Bumped when the delta bookkeeping is dropped, so a chain file being written meanwhile does not become a base.
+        int chainGeneration;
 
         /// <summary>Create an empty store in the configured mode.</summary>
         public SortedSetMemberStore() : this(MemberMode) { }
@@ -108,6 +134,9 @@ namespace Garnet.server
                 segments = new List<Segment>();
                 gate = new object();
                 deletes = new List<(int, long, long)>();
+                changes = new List<(int, long)>();
+                if (SortedSetSideStore.DeltaMode)
+                    deletedKeys = new List<(int, byte[])>();
             }
             else
                 plain = new Dictionary<byte[], double>(ByteArrayComparer.Instance);
@@ -181,7 +210,17 @@ namespace Garnet.server
                 score = Score(slot);
                 Capture(slot);
                 if (Id(slot) <= lastViewLimit)
+                {
                     CountDelete(key.Length);
+                    if (deletedKeys is not null)
+                    {
+                        deletedKeys.Add((epoch, key));
+                        // Bound the retained keys when no snapshot write moves the base (e.g. the record stays below the snapshot range):
+                        // drop them and the base, so the next chain file is full.
+                        if (deletedKeys.Count > (live.Count >> 2) + 1024)
+                            DropBase();
+                    }
+                }
                 _ = live.Remove(key);
                 Flags(slot) &= unchecked((byte)~LiveFlag);
                 if (!Pending(slot)) Release(slot);
@@ -224,8 +263,23 @@ namespace Garnet.server
                         view.DeletedKeyBytesSinceBase += d.KeyBytes;
                     }
                 }
+                foreach (var c in changes)
+                {
+                    if (c.Epoch > baseEpoch && c.Epoch <= epoch)
+                        view.ChangedSinceBase += c.Count;
+                }
+                if (deletedKeys is not null)
+                {
+                    view.DeletedKeysSinceBase = new List<byte[]>();
+                    foreach (var d in deletedKeys)
+                    {
+                        if (d.Epoch > baseEpoch && d.Epoch <= epoch)
+                            view.DeletedKeysSinceBase.Add(d.Key);
+                    }
+                }
                 epoch++;
                 lastViewLimit = lastId;
+                view.ChainGeneration = chainGeneration;
                 Volatile.Write(ref active, view);
                 return view;
             }
@@ -274,7 +328,45 @@ namespace Garnet.server
                 Validate(view);
                 baseEpoch = view.Epoch;
                 _ = deletes.RemoveAll(d => d.Epoch <= baseEpoch);
+                _ = changes.RemoveAll(c => c.Epoch <= baseEpoch);
+                _ = deletedKeys?.RemoveAll(d => d.Epoch <= baseEpoch);
             }
+        }
+
+        /// <summary>The view was written to side store file <paramref name="seq"/> (flushed to disk): it is the new base.</summary>
+        public void CommitChainFile(View view, long seq, bool full)
+        {
+            CommitBase(view);
+            lock (gate)
+            {
+                if (view.ChainGeneration != chainGeneration)
+                {
+                    // Deletes after this view were dropped meanwhile: a delta against this file could miss them.
+                    BaseSeq = ChainStart = 0;
+                    ChainDeltas = 0;
+                    return;
+                }
+                ChainStart = full ? seq : ChainStart;
+                ChainDeltas = full ? 0 : ChainDeltas + 1;
+                BaseSeq = seq;
+            }
+        }
+
+        /// <summary>The view was written into the snapshot file in full, not to the side store: the next chain file must be full.</summary>
+        public void ResetChain(View view)
+        {
+            CommitBase(view);
+            lock (gate)
+                DropBase();
+        }
+
+        // Caller holds the gate.
+        void DropBase()
+        {
+            BaseSeq = ChainStart = 0;
+            ChainDeltas = 0;
+            deletedKeys?.Clear();
+            chainGeneration++;
         }
 
         /// <summary>Drain what the reader has not read, releasing retained members and old scores, and close the view.</summary>
@@ -303,6 +395,14 @@ namespace Garnet.server
         ref int ModEpoch(int slot) => ref Seg(slot).ModEpochs[slot & SegmentMask];
         ref int OldModEpoch(int slot) => ref Seg(slot).OldModEpochs[slot & SegmentMask];
 
+        void CountChange()
+        {
+            if (changes.Count > 0 && changes[^1].Epoch == epoch)
+                changes[^1] = (epoch, changes[^1].Count + 1);
+            else
+                changes.Add((epoch, 1));
+        }
+
         void CountDelete(int keyBytes)
         {
             if (deletes.Count > 0 && deletes[^1].Epoch == epoch)
@@ -324,7 +424,11 @@ namespace Garnet.server
                     if (mustAdd) throw new ArgumentException("An item with the same key has already been added.");
                     Capture(slot);
                     Score(slot) = score;
-                    ModEpoch(slot) = epoch;
+                    if (ModEpoch(slot) != epoch)
+                    {
+                        ModEpoch(slot) = epoch;
+                        CountChange();
+                    }
                     return;
                 }
                 var id = checked(lastId + 1);
@@ -335,6 +439,7 @@ namespace Garnet.server
                 Id(slot) = id;
                 Score(slot) = score;
                 ModEpoch(slot) = epoch;
+                CountChange();
                 Flags(slot) = LiveFlag;
                 Prev(slot) = tail;
                 Next(slot) = None;

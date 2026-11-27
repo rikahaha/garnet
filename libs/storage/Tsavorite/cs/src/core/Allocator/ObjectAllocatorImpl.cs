@@ -947,7 +947,19 @@ namespace Tsavorite.core
                                     // The main-log allocator page is left untouched by these calls.
                                     logRecord.SetReuseObjectIdForSize();
 
-                                    var valueObjectLength = logWriter.WriteRecordObjects(in keyOverflow, in valueOverflow, in valueObject);
+                                    ulong valueObjectLength;
+                                    var forSnapshot = asyncResult.flushRequestState == FlushRequestState.Snapshot;
+                                    if (forSnapshot)
+                                        HeapObjectBase.SetSnapshotFlush(true);
+                                    try
+                                    {
+                                        valueObjectLength = logWriter.WriteRecordObjects(in keyOverflow, in valueOverflow, in valueObject);
+                                    }
+                                    finally
+                                    {
+                                        if (forSnapshot)
+                                            HeapObjectBase.SetSnapshotFlush(false);
+                                    }
                                     logRecord.SetObjectLogRecordStartPositionAndLength(recordStartPosition, valueObjectLength);
                                 }
                                 else

@@ -23,14 +23,14 @@ namespace Garnet.server
             if (string.IsNullOrEmpty(path))
                 return;
             writer = new StreamWriter(path, append: true) { AutoFlush = true };
-            writer.WriteLine("unix_ms,object,members,changed,deleted,base_epoch,full_bytes,delta_bytes");
+            writer.WriteLine("unix_ms,object,members,changed,deleted,base_epoch,full_bytes,delta_bytes,written,file_bytes");
             Enabled = true;
         }
 
-        public static void Record(object obj, long members, long changed, long deleted, int baseEpoch, long fullBytes, long deltaBytes)
+        public static void Record(object obj, long members, long changed, long deleted, int baseEpoch, long fullBytes, long deltaBytes, string written, long fileBytes)
         {
             var line = FormattableString.Invariant(
-                $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()},{obj.GetType().Name}:{obj.GetHashCode():x},{members},{changed},{deleted},{baseEpoch},{fullBytes},{deltaBytes}");
+                $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()},{obj.GetType().Name}:{obj.GetHashCode():x},{members},{changed},{deleted},{baseEpoch},{fullBytes},{deltaBytes},{written},{fileBytes}");
             lock (writerLock)
                 writer.WriteLine(line);
         }

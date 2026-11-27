@@ -226,6 +226,6 @@ if __name__ == "__main__":
     which = sys.argv[1:] or ["a", "b", "c"]
     ok = True
     for name in which:
-        ok &= {"a": scenario_a, "b": scenario_b, "c": scenario_c}[name]()
+        ok &= {"a": scenario_a, "b": scenario_b, "c": lambda: scenario_c(int(os.environ.get("ROUNDS", 3)))}[name]()
     shutil.rmtree(WORK, ignore_errors=True)
     sys.exit(0 if ok else 1)

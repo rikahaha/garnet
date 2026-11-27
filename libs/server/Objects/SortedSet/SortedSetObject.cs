@@ -183,6 +183,23 @@ namespace Garnet.server
             sortedSetDict = new SortedSetMemberStore();
 
             var count = reader.ReadInt32();
+            if (count == SortedSetSideStore.StubMarker)
+            {
+                // Delta mode stub: the members are in the side store.
+                var uid = reader.ReadInt64();
+                var seq = reader.ReadInt64();
+                var expected = reader.ReadInt32();
+                var members = SortedSetSideStore.LoadChain(uid, seq);
+                if (members.Count != expected)
+                    throw new GarnetException($"Sorted set side store chain of {uid:x16} at {seq} has {members.Count} members, expected {expected}");
+                foreach (var (item, score) in members)
+                {
+                    sortedSetDict.Add(item, score);
+                    _ = sortedSet.Add((score, item));
+                    UpdateSize(item);
+                }
+                return;
+            }
             for (var i = 0; i < count; i++)
             {
                 var keyLength = reader.ReadInt32();
@@ -327,56 +344,130 @@ namespace Garnet.server
         }
 
         /// <inheritdoc />
-        protected override void WriteSnapshotView(BinaryWriter writer)
+        protected override bool WriteSnapshotView(BinaryWriter writer)
         {
             var view = snapshotView ?? throw new InvalidOperationException("No open snapshot view");
             try
             {
-                // Same format as DoSerialize for an object without member TTLs.
-                base.DoSerialize(writer);
-                writer.Write(view.Count);
-                var rows = new List<(byte[] Key, double Score)>(128);
-                var changed = SortedSetDeltaTrace.Enabled ? new List<bool>(128) : null;
-                var written = 0;
-                long fullBytes = sizeof(int), changedCount = 0, changedBytes = 0;
-                while (!sortedSetDict.Done(view))
+                // Delta mode: a large set flushed into a snapshot file goes to the side store, and the snapshot gets a stub. Anything
+                // else (the main log, small sets) gets the members inline, exactly as DoSerialize writes them.
+                if (HeapObjectBase.InSnapshotFlush && SortedSetSideStore.Enabled && view.Count >= SortedSetSideStore.MinMembers)
                 {
-                    sortedSetDict.ReadInto(view, rows, changed: changed);
-                    for (var i = 0; i < rows.Count; i++)
-                    {
-                        var (key, score) = rows[i];
-                        writer.Write(key.Length);
-                        writer.Write(key);
-                        writer.Write(score);
-                        if (changed is not null)
-                        {
-                            var rowBytes = sizeof(int) + key.Length + sizeof(double);
-                            fullBytes += rowBytes;
-                            if (changed[i])
-                            {
-                                changedCount++;
-                                changedBytes += rowBytes;
-                            }
-                        }
-                    }
-                    written += rows.Count;
+                    WriteViewToSideStore(writer, view);
+                    return true;
                 }
-                if (written != view.Count)
-                    throw new InvalidOperationException($"Snapshot view wrote {written} members, expected {view.Count}");
-                if (changed is not null)
-                {
-                    // Delta = changed or added rows, plus deleted keys (length + key), plus two counts. No base: a full write.
-                    var deltaBytes = view.BaseEpoch == 0 ? fullBytes
-                        : 2 * sizeof(int) + changedBytes + view.DeletedSinceBase * sizeof(int) + view.DeletedKeyBytesSinceBase;
-                    SortedSetDeltaTrace.Record(sortedSetDict, view.Count, changedCount, view.DeletedSinceBase, view.BaseEpoch, fullBytes, deltaBytes);
-                }
-                // Assume this checkpoint completes: the next view's delta is against this one.
-                sortedSetDict.CommitBase(view);
+                WriteViewInline(writer, view);
+                return false;
             }
             finally
             {
                 CloseSnapshotView();
             }
+        }
+
+        void WriteViewInline(BinaryWriter writer, SortedSetMemberStore.View view)
+        {
+            // Same format as DoSerialize for an object without member TTLs.
+            base.DoSerialize(writer);
+            writer.Write(view.Count);
+            var rows = new List<(byte[] Key, double Score)>(128);
+            var changed = SortedSetDeltaTrace.Enabled ? new List<bool>(128) : null;
+            var written = 0;
+            long fullBytes = sizeof(int), changedCount = 0, changedBytes = 0;
+            while (!sortedSetDict.Done(view))
+            {
+                sortedSetDict.ReadInto(view, rows, changed: changed);
+                for (var i = 0; i < rows.Count; i++)
+                {
+                    var (key, score) = rows[i];
+                    writer.Write(key.Length);
+                    writer.Write(key);
+                    writer.Write(score);
+                    if (changed is not null)
+                    {
+                        var rowBytes = sizeof(int) + key.Length + sizeof(double);
+                        fullBytes += rowBytes;
+                        if (changed[i])
+                        {
+                            changedCount++;
+                            changedBytes += rowBytes;
+                        }
+                    }
+                }
+                written += rows.Count;
+            }
+            if (written != view.Count)
+                throw new InvalidOperationException($"Snapshot view wrote {written} members, expected {view.Count}");
+            if (changed is not null)
+            {
+                // Estimated delta = changed or added rows, plus deleted keys (length + key), plus two counts. No base: a full write.
+                var deltaBytes = view.BaseEpoch == 0 ? fullBytes
+                    : 2 * sizeof(int) + changedBytes + view.DeletedSinceBase * sizeof(int) + view.DeletedKeyBytesSinceBase;
+                SortedSetDeltaTrace.Record(sortedSetDict, view.Count, changedCount, view.DeletedSinceBase, view.BaseEpoch, fullBytes, deltaBytes,
+                    HeapObjectBase.InSnapshotFlush ? "inline" : "inline_mainlog", 0);
+            }
+
+            if (!SortedSetSideStore.DeltaMode)
+                sortedSetDict.CommitBase(view);  // estimate only (step 1): assume this checkpoint completes
+            else if (HeapObjectBase.InSnapshotFlush)
+                sortedSetDict.ResetChain(view);  // the snapshot holds this set inline; a later chain must start with a full file
+        }
+
+        void WriteViewToSideStore(BinaryWriter writer, SortedSetMemberStore.View view)
+        {
+            var store = sortedSetDict;
+            var uid = store.Uid;
+            var full = store.BaseSeq == 0
+                || store.ChainDeltas >= SortedSetSideStore.MaxChainDeltas
+                || view.ChangedSinceBase + view.DeletedSinceBase > SortedSetSideStore.MaxDeltaRatio * view.Count
+                || !SortedSetSideStore.Exists(uid, store.BaseSeq)
+                || !SortedSetSideStore.Exists(uid, store.ChainStart);
+            var seq = store.BaseSeq + 1;
+            var chainStart = full ? seq : store.ChainStart;
+
+            long changedCount = 0, fileBytes;
+            using (var file = SortedSetSideStore.CreateWriter(uid, seq, full, full ? 0 : store.BaseSeq, chainStart))
+            {
+                if (!full)
+                {
+                    foreach (var key in view.DeletedKeysSinceBase)
+                        file.Delete(key);
+                }
+                var rows = new List<(byte[] Key, double Score)>(128);
+                var changed = full ? null : new List<bool>(128);
+                var read = 0;
+                while (!store.Done(view))
+                {
+                    store.ReadInto(view, rows, changed: changed);
+                    for (var i = 0; i < rows.Count; i++)
+                    {
+                        if (full || changed[i])
+                        {
+                            file.Upsert(rows[i].Key, rows[i].Score);
+                            changedCount++;
+                        }
+                    }
+                    read += rows.Count;
+                }
+                if (read != view.Count)
+                    throw new InvalidOperationException($"Snapshot view read {read} members, expected {view.Count}");
+                file.Commit();
+                fileBytes = file.Length;
+            }
+
+            // The file is on disk: it is the base for the next chain file, and this checkpoint's stub refers to its chain.
+            store.CommitChainFile(view, seq, full);
+            SortedSetSideStore.RecordCheckpointReference(uid, chainStart);
+
+            base.DoSerialize(writer);
+            writer.Write(SortedSetSideStore.StubMarker);
+            writer.Write(uid);
+            writer.Write(seq);
+            writer.Write(view.Count);
+
+            if (SortedSetDeltaTrace.Enabled)
+                SortedSetDeltaTrace.Record(store, view.Count, changedCount, full ? 0 : view.DeletedSinceBase, view.BaseEpoch, 0, 0,
+                    full ? "side_full" : "side_delta", fileBytes);
         }
 
         /// <inheritdoc />

@@ -8,8 +8,9 @@ Environment:
   GARNET_NUMA   command prefix for the server, e.g. "numactl --cpunodebind=1 --membind=1"
   BENCH_BIN     ThroughputBench executable (default: local build via dotnet)
   CLIENT_NUMA   command prefix for the benchmark client
-  GARNET_SORTEDSET_MEMBER_CHECKPOINT, TSAVORITE_SERIALIZE_POOLED  passed through to the server
-Writes <out_prefix>.json (benchmark output), <out_prefix>_trace.csv (server checkpoint trace), <out_prefix>_server.log.
+  GARNET_SORTEDSET_MEMBER_CHECKPOINT, TSAVORITE_SERIALIZE_POOLED, GARNET_SORTEDSET_DELTA  passed through to the server
+Writes <out_prefix>.json (benchmark output), <out_prefix>_trace.csv (server checkpoint trace), <out_prefix>_server.log,
+<out_prefix>_delta.csv (sorted set side store writes) and <out_prefix>_ckptbytes.txt (bytes of the last checkpoint's files).
 """
 import os, shlex, shutil, signal, socket, subprocess, sys, time
 
@@ -29,11 +30,12 @@ def main():
     bench_args = [f"port={PORT}", *sys.argv[2:]]
     shutil.rmtree(WORK, ignore_errors=True); os.makedirs(WORK)
     trace = f"{WORK}/trace.csv"
+    delta = f"{WORK}/delta.csv"
     log = open(f"{WORK}/server.log", "w")
     server = subprocess.Popen([*cmd("GARNET_NUMA", "GARNET_BIN", LOCAL_GARNET), "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
                                "--device-type", "RandomAccess", "--logger-level", "Information", "-m", "8g", "-i", "64m"],
                               stdout=log, stderr=subprocess.STDOUT,
-                              env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet", "TSAVORITE_COU_TRACE": trace})
+                              env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet", "TSAVORITE_COU_TRACE": trace, "GARNET_DELTA_TRACE": delta})
     try:
         for _ in range(600):
             try: socket.create_connection(("127.0.0.1", PORT)).close(); break
@@ -44,6 +46,15 @@ def main():
         server.send_signal(signal.SIGKILL); server.wait()
         log.close()
         if os.path.exists(trace): shutil.copy(trace, f"{out}_trace.csv")
+        if os.path.exists(delta): shutil.copy(delta, f"{out}_delta.csv")
+        with open(f"{out}_ckptbytes.txt", "w") as f:
+            # Files of the checkpoint that is kept (snapshot, metadata, index) and the side store; not the main log.
+            for name in ("cpr-checkpoints", "index-checkpoints", "sortedset-members"):
+                total = 0
+                for root, _, files in os.walk(f"{WORK}/ckpt"):
+                    if f"/{name}" in root:
+                        total += sum(os.path.getsize(os.path.join(root, x)) for x in files)
+                f.write(f"{name} {total}\n")
         shutil.copy(f"{WORK}/server.log", f"{out}_server.log")
         shutil.rmtree(WORK, ignore_errors=True)   # checkpoints are large
 
