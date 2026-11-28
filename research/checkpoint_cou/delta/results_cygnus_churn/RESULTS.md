@@ -1,6 +1,6 @@
 # cygnus：改动比例扫描（2026-11-28）
 
-GarnetServer `ckpt-delta` `91f43ba`（改动列表 + 改动超过 10% 时内联写进快照）。`paper_eval.py churn`，表格由 `churn_tables.py` 生成。
+GarnetServer `ckpt-delta` `2cc2be9`（改动列表 + 改动超过 10% 时内联写进快照）。`paper_eval.py churn`，表格由 `churn_tables.py` 生成。
 server NUMA 1 / client NUMA 0，`-m 32g` 缓存模式。20 × 100 万成员，16 个连接，均匀随机，45 s，第 5、12、…、40 s 共 6 次 BGSAVE；
 写的比例（ZINCRBY 占比，其余为 ZSCORE）取 1 / 5 / 20 / 50 / 100%，每点 1 次。所有运行结束时集合大小正常。服务器目录已删除。
 

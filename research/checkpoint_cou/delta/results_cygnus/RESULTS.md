@@ -1,6 +1,6 @@
 # cygnus：原版 vs 快照视图 vs 增量（2026-11-28）
 
-GarnetServer 为 `ckpt-delta` 的 `75deedd`（linux-x64 自包含）。`run_delta_server.sh`。server `numactl --cpunodebind=1 --membind=1`，
+GarnetServer 为 `ckpt-delta` 的 `8301d0d`（linux-x64 自包含）。`run_delta_server.sh`。server `numactl --cpunodebind=1 --membind=1`，
 客户端 `--cpunodebind=0 --membind=0`；开始前负载 0.2。`-m 32g`（缓存模式，无 `--storage-tier`；上限足够大，不会淘汰）。
 运行后已删除服务器上的 `~/member-delta/`。
 

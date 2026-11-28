@@ -1,6 +1,6 @@
 # cygnus：改动列表 vs 扫描，分段计时、内存、GC（2026-11-28）
 
-GarnetServer `ckpt-delta` `2f5ed5a`，`paper_eval.py listcmp`。server NUMA 1 / client NUMA 0，`-m 32g` 缓存模式，开始前负载 0.16。
+GarnetServer `ckpt-delta` `e49dbb1`，`paper_eval.py listcmp`。server NUMA 1 / client NUMA 0，`-m 32g` 缓存模式，开始前负载 0.16。
 均匀负载（ZSCORE / ZINCRBY 各半），20 × 100 万成员，16 / 64 / 128 个连接，45 s，第 5、12、…、40 s 共 6 次 BGSAVE，每组 2 次。
 配置：baseline、viewpooled、delta_scan（`GARNET_SORTEDSET_DELTA_LIST=0`，扫描全部成员找改动）、delta（改动列表）。
 所有运行结束时集合大小正常（无 WARNING）。服务器目录已删除。逐次分段见下方命令的输出（`*_delta.csv` 的 scan_us / encode_us /

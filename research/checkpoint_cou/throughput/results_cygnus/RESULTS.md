@@ -1,6 +1,6 @@
 # 多客户端吞吐量：原始 Garnet vs 快照视图（cygnus）
 
-2026-11-25，cygnus。GarnetServer 为 `4ba0fb2`（之后 Garnet 代码未改）的 linux-x64 自包含版本；压测程序 `ThroughputBench`。
+2026-11-25，cygnus。GarnetServer 为 `9cf889d`（之后 Garnet 代码未改）的 linux-x64 自包含版本；压测程序 `ThroughputBench`。
 server `numactl --cpunodebind=1 --membind=1`，客户端 `numactl --cpunodebind=0 --membind=0`；开始前两个节点 CPU 忙碌 0%。
 运行后已删除服务器上的 `~/member-tput/`。
 

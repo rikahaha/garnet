@@ -1,6 +1,6 @@
 # cygnus：改动比例扫描，64 / 128 个连接（2026-11-28）
 
-GarnetServer `ckpt-delta` `91f43ba`（与 16 个连接那轮相同：改动列表 + 改动超过 10% 时内联写进快照）。`paper_eval.py churn`，
+GarnetServer `ckpt-delta` `2cc2be9`（与 16 个连接那轮相同：改动列表 + 改动超过 10% 时内联写进快照）。`paper_eval.py churn`，
 `CHURN_CLIENTS="64 128"`，表格由 `churn_tables.py results_cygnus_churn_hi <clients>` 生成。设置同 `../results_cygnus_churn/`：
 20 × 100 万成员，均匀随机，45 s，6 次 BGSAVE（相隔 7 s），写的比例 1 / 5 / 20 / 50 / 100%，每点 1 次，`-m 32g` 缓存模式。
 所有运行结束时集合大小正常。服务器目录已删除。（第一次上传时网络中断，清理后重新打包上传。）

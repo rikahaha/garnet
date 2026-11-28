@@ -1,6 +1,6 @@
 # 第三轮（cygnus）：写入优先、批缓冲复用、数组布局
 
-2026-11-06 12:35–12:55 JST，cygnus，程序为本地 `e51cc75` 发布的 linux-x64 版本。CPU 范围与前两轮相同
+2026-11-06 12:35–12:55 JST，cygnus，程序为本地 `2add8fa` 发布的 linux-x64 版本。CPU 范围与前两轮相同
 （`numactl --physcpubind=1,3,5,7,9,11,13,15 --membind=1`，server GC 堆数 8），开始前目标 CPU 忙碌 0–1%。
 原始数据：`results/round3_*.jsonl`（72 条）。运行后已删除服务器上的 `~/member-protocol/`。
 

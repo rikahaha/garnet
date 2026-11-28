@@ -1,6 +1,6 @@
 # cygnus：高改动走快照（25% 门槛）+ GC 事件（2026-11-28）
 
-GarnetServer `ckpt-delta` `90d179a`（`cae95c3` 的"改动超过 1/4 时内联写进快照" + GC 事件记录）。`paper_eval.py listcmp`，
+GarnetServer `ckpt-delta` `af75a98`（`9ef59ed` 的"改动超过 1/4 时内联写进快照" + GC 事件记录）。`paper_eval.py listcmp`，
 `LISTCMP_CONFIGS="baseline viewpooled delta"`，均匀负载，16 / 64 / 128 个连接，6 次 checkpoint，每组 2 次。`-m 32g`，NUMA 绑定同前。
 所有运行结束时集合大小正常。服务器目录已删除。每次运行的时长与吞吐量见 `summary_durations.txt`。
 
@@ -13,7 +13,7 @@ GarnetServer `ckpt-delta` `90d179a`（`cae95c3` 的"改动超过 1/4 时内联�
 改动列表超过内存上限（集合的 1/4）→ 丢弃基版本 → 下一次又是全量，循环。每次 checkpoint 20 个集合中 14–15 个写全量。
 而且即使写成差量，约 20% 的差量也要约 1.9 s（上一轮数据），慢于快照路径。
 
-已修正（`91f43ba`）：门槛降到 10%（`GARNET_SORTEDSET_DELTA_RATIO` 可调），改动列表的内存上限放宽到集合的一半并与门槛分开。
+已修正（`2cc2be9`）：门槛降到 10%（`GARNET_SORTEDSET_DELTA_RATIO` 可调），改动列表的内存上限放宽到集合的一半并与门槛分开。
 
 ## 2. 长停顿的 GC 类型和触发原因
 

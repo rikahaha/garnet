@@ -1,6 +1,6 @@
 # 持续增删负载（第二轮）：扫描卡顿归因与 server GC 成本
 
-2026-11-06 11:55–12:10 JST，cygnus，程序为本地 `2514895` 发布的 linux-x64 自带运行时版本。
+2026-11-06 11:55–12:10 JST，cygnus，程序为本地 `f51a071` 发布的 linux-x64 自带运行时版本。
 CPU 范围 `numactl --physcpubind=1,3,5,7,9,11,13,15 --membind=1`；server GC 堆数 8。开始前这 8 个 CPU 忙碌 0–2%。
 原始数据：`results/churn_jit_cygnus.jsonl`（A，24 条）、`results/churn_servergc_cygnus.jsonl`（B，24 条）。
 运行后已删除服务器上的 `~/member-protocol/`。

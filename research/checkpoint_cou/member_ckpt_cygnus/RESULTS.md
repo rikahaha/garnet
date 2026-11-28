@@ -1,6 +1,6 @@
 # 快照视图接入 Garnet 后的第一次 cygnus 测量
 
-2026-11-10，cygnus。程序为本地 `4ba0fb2` 发布的 linux-x64 自包含版本，脚本 `run_member_ckpt.sh`。
+2026-11-10，cygnus。程序为本地 `9cf889d` 发布的 linux-x64 自包含版本，脚本 `run_member_ckpt.sh`。
 server `numactl --cpunodebind=1 --membind=1`，客户端 `numactl --cpunodebind=0 --membind=0`（与之前的 baseline 测量相同），
 开始前两个 NUMA 节点的 CPU 平均忙碌 3% / 1%。运行后已删除服务器上的 `~/member-ckpt/`。
 

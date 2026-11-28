@@ -1,6 +1,6 @@
 # 持续增删负载：cygnus 上的 GC 对照（当前版本，未复用批缓冲）
 
-2026-10-30 15:58–16:02 JST，cygnus（Xeon Gold 5418N，Ubuntu 22.04），程序为本地 `c593d31` 发布的 linux-x64 自带运行时版本。
+2026-10-30 15:58–16:02 JST，cygnus（Xeon Gold 5418N，Ubuntu 22.04），程序为本地 `696704a` 发布的 linux-x64 自带运行时版本。
 原始数据：`results/churn_cygnus.jsonl`（72 条），运行日志：`results/churn_cygnus_run.log`。
 运行结束后已删除服务器上的 `~/member-protocol/`。
 

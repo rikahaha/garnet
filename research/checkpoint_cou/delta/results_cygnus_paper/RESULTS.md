@@ -1,6 +1,6 @@
 # cygnus：参照 Garnet 论文第 8 节设计的实验（2026-11-28）
 
-GarnetServer `ckpt-delta` 的 `75deedd`（Garnet 代码与之后的提交相同），`paper_eval.py`（`672024c`），`run_paper_server.sh`。
+GarnetServer `ckpt-delta` 的 `8301d0d`（Garnet 代码与之后的提交相同），`paper_eval.py`（`0b163f4`），`run_paper_server.sh`。
 server `numactl --cpunodebind=1 --membind=1`，客户端 `--cpunodebind=0 --membind=0`；开始前负载 0.64。`-m 32g`，缓存模式（无
 `--storage-tier`）。每组 2 次重复。所有大集合运行结束时 ZCARD 都等于预装成员数（`*_sizes.txt`，无 WARNING）。服务器目录已删除。
 
