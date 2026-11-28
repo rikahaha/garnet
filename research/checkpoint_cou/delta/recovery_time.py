@@ -9,12 +9,13 @@ every set has MEMBERS members. An empty restart is timed as the fixed startup co
   baseline  plain Garnet (members inline in the snapshot)
   delta     snapshot views + pooled bytes + side store chains
 
-Usage: recovery_time.py [out_csv]   (env SETS, MEMBERS, REPS, MEM = log memory limit, default 32g)
+Usage: recovery_time.py [out_csv]   (env SETS, MEMBERS, REPS, MEM = log memory limit, default 32g;
+       GARNET_BIN / BENCH_BIN self-contained executables and GARNET_NUMA / CLIENT_NUMA prefixes as for throughput_run.py)
 
 MEM defaults to 32g: without --storage-tier Garnet is a cache (NullDevice main log), and with -m 8g this load evicts whole
 sorted sets after ~3 checkpoints (see ../upstream_bug/SORTEDSET_LOSS_UNDER_MEMORY_LIMIT.md).
 """
-import os, shutil, signal, socket, subprocess, sys, time
+import os, shlex, shutil, signal, socket, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DOTNET = "/usr/local/share/dotnet/dotnet"
@@ -33,6 +34,15 @@ CONFIGS = {
 }
 
 
+def server_cmd():
+    """GARNET_NUMA prefix, then GARNET_BIN (self-contained executable) or the local build run with dotnet."""
+    return shlex.split(os.environ.get("GARNET_NUMA", "")) + ([os.environ["GARNET_BIN"]] if os.environ.get("GARNET_BIN") else [DOTNET, GARNET])
+
+
+def bench_cmd():
+    return shlex.split(os.environ.get("CLIENT_NUMA", "")) + ([os.environ["BENCH_BIN"]] if os.environ.get("BENCH_BIN") else [DOTNET, BENCH])
+
+
 def resp(*args):
     out = [b"*%d\r\n" % len(args)]
     for a in args:
@@ -49,7 +59,7 @@ def command(*args):
 
 def start(env, recover):
     log = open(os.path.join(WORK, "server.log"), "a")
-    args = [DOTNET, GARNET, "--port", str(PORT), "--checkpointdir", os.path.join(WORK, "ckpt"), "--device-type", "RandomAccess",
+    args = [*server_cmd(), "--port", str(PORT), "--checkpointdir", os.path.join(WORK, "ckpt"), "--device-type", "RandomAccess",
             "--logger-level", "Information", "-m", os.environ.get("MEM", "32g"), "-i", "64m"] + (["--recover"] if recover else [])
     t0 = time.time()
     p = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, **env, "DOTNET_ROOT": "/usr/local/share/dotnet"})
@@ -85,7 +95,7 @@ def run(config, deltas):
     p, _ = start(env, recover=False)
     try:
         saves = [1 + 3 * i for i in range(deltas + 1)]
-        subprocess.run([DOTNET, BENCH, f"port={PORT}", f"sets={SETS}", f"members={MEMBERS}", "clients=16", "pipeline=1", "readpct=50",
+        subprocess.run([*bench_cmd(), f"port={PORT}", f"sets={SETS}", f"members={MEMBERS}", "clients=16", "pipeline=1", "readpct=50",
                         f"run={saves[-1] + 3}", "saveat=" + ",".join(map(str, saves))],
                        stdout=subprocess.DEVNULL, check=True, env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet"})
         # The last checkpoint must have completed: LASTSAVE moves at each one; wait a little for the last.

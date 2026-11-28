@@ -9,8 +9,10 @@ Environment:
   BENCH_BIN     ThroughputBench executable (default: local build via dotnet)
   CLIENT_NUMA   command prefix for the benchmark client
   GARNET_SORTEDSET_MEMBER_CHECKPOINT, TSAVORITE_SERIALIZE_POOLED, GARNET_SORTEDSET_DELTA  passed through to the server
+  MEM           log memory limit (-m), default 8g. Without --storage-tier Garnet evicts whole keys past it, so use a large value.
 Writes <out_prefix>.json (benchmark output), <out_prefix>_trace.csv (server checkpoint trace), <out_prefix>_server.log,
-<out_prefix>_delta.csv (sorted set side store writes) and <out_prefix>_ckptbytes.txt (bytes of the last checkpoint's files).
+<out_prefix>_delta.csv (sorted set side store writes), <out_prefix>_ckptbytes.txt (bytes of the last checkpoint's files) and
+<out_prefix>_sizes.txt (ZCARD of every set at the end, to detect eviction).
 """
 import os, shlex, shutil, signal, socket, subprocess, sys, time
 
@@ -33,7 +35,7 @@ def main():
     delta = f"{WORK}/delta.csv"
     log = open(f"{WORK}/server.log", "w")
     server = subprocess.Popen([*cmd("GARNET_NUMA", "GARNET_BIN", LOCAL_GARNET), "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
-                               "--device-type", "RandomAccess", "--logger-level", "Information", "-m", "8g", "-i", "64m"],
+                               "--device-type", "RandomAccess", "--logger-level", "Information", "-m", os.environ.get("MEM", "8g"), "-i", "64m"],
                               stdout=log, stderr=subprocess.STDOUT,
                               env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet", "TSAVORITE_COU_TRACE": trace, "GARNET_DELTA_TRACE": delta})
     try:
@@ -42,6 +44,13 @@ def main():
             except OSError: time.sleep(0.1)
         with open(f"{out}.json", "w") as f:
             subprocess.run([*cmd("CLIENT_NUMA", "BENCH_BIN", LOCAL_BENCH), *bench_args], stdout=f, check=True)
+        sets = int(next((x.split("=", 1)[1] for x in bench_args if x.startswith("sets=")), "20"))
+        with socket.create_connection(("127.0.0.1", PORT)) as c, open(f"{out}_sizes.txt", "w") as f:
+            r = c.makefile("rb")
+            for i in range(sets):
+                key = f"z{i}".encode()
+                c.sendall(b"*2\r\n$5\r\nZCARD\r\n$%d\r\n%s\r\n" % (len(key), key))
+                f.write(f"z{i} {int(r.readline()[1:])}\n")
     finally:
         server.send_signal(signal.SIGKILL); server.wait()
         log.close()
