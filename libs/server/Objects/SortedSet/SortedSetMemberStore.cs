@@ -513,8 +513,9 @@ namespace Garnet.server
             if (changedSlots is not null)
             {
                 changedSlots.Add((epoch, slot, Id(slot)));
-                // Past a quarter of the set the next chain file is full anyway: drop the list (and the base) to bound memory.
-                if (changedSlots.Count > (live.Count >> 2) + 1024 && !dropChangesOnClose)
+                // Bound the memory: past half the set (far above the delta threshold) drop the list and the base. Not tied to the
+                // threshold, so that writes during a long checkpoint do not drop the base the next delta needs.
+                if (changedSlots.Count > (live.Count >> 1) + 1024 && !dropChangesOnClose)
                     DropBase();
             }
             if (changes.Count > 0 && changes[^1].Epoch == epoch)

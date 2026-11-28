@@ -16,7 +16,8 @@ Environment: GARNET_BIN / BENCH_BIN / RB_BIN (Resp.bench) self-contained executa
 GARNET_NUMA / CLIENT_NUMA command prefixes, MEM (log memory limit, default 32g), REPS (default 2).
   listcmp   Delta writes from the change list vs by scanning every member (and baseline, viewpooled): uniform load, 16 / 64 / 128
             clients, 6 checkpoints; phase timing (delta trace), server RSS and GC traces.
-Usage: paper_eval.py <out_dir> [zaddrem] [savetime] [rounds] [scaling] [listcmp]
+  churn     Checkpoint cost vs share of members changed between checkpoints (write share 1/5/20/50/100%), 16 clients.
+Usage: paper_eval.py <out_dir> [zaddrem] [savetime] [rounds] [scaling] [listcmp] [churn]
 """
 import csv, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time
 
@@ -251,6 +252,25 @@ def listcmp(out):
                     print(f"  WARNING {name}: set sizes at the end {sorted(sizes)}", flush=True)
 
 
+def churn(out):
+    """Checkpoint cost vs the share of members changed between checkpoints: 16 clients, uniform, 6 checkpoints 7 s apart; the
+    write share (100 - readpct) sets how many members change. One run per point."""
+    run = os.path.join(HERE, "../throughput/throughput_run.py")
+    analyze = os.path.join(HERE, "../throughput/throughput_analyze.py")
+    saves = [5 + 7 * i for i in range(6)]
+    for readpct in os.environ.get("CHURN_READPCT", "99 95 80 50 0").split():
+        for config in ("baseline", "viewpooled", "delta"):
+            name = f"{out}/churn_{config}_read{readpct}"
+            env = {**os.environ, **CONFIGS[config], "MEM": MEM}
+            args = ["members=1000000", "sets=20", "clients=16", "pipeline=1", f"readpct={readpct}", f"run={saves[-1] + 5}",
+                    "saveat=" + ",".join(map(str, saves))]
+            subprocess.run([sys.executable, "-I", run, name, *args], env=env, check=True, stderr=subprocess.DEVNULL)
+            subprocess.run([sys.executable, "-I", analyze, name], check=True)
+            sizes = {int(l.split()[1]) for l in open(f"{name}_sizes.txt")}
+            if sizes != {1000000}:
+                print(f"  WARNING {name}: set sizes at the end {sorted(sizes)}", flush=True)
+
+
 def savetime(out):
     rows = []
     for rep in range(1, REPS + 1):
@@ -301,5 +321,5 @@ if __name__ == "__main__":
     out = os.path.abspath(sys.argv[1])
     os.makedirs(out, exist_ok=True)
     for what in sys.argv[2:] or ["zaddrem", "savetime", "rounds", "scaling"]:
-        {"zaddrem": zaddrem, "scaling": scaling, "savetime": savetime, "rounds": rounds, "listcmp": listcmp}[what](out)
+        {"zaddrem": zaddrem, "scaling": scaling, "savetime": savetime, "rounds": rounds, "listcmp": listcmp, "churn": churn}[what](out)
     shutil.rmtree(os.path.join(out, "work"), ignore_errors=True)

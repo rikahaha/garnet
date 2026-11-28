@@ -37,8 +37,11 @@ namespace Garnet.server
         /// <summary>Write a full file instead of another delta once a chain has this many deltas.</summary>
         public const int MaxChainDeltas = 4;
 
-        /// <summary>Write a full file instead of a delta when the estimated changed members exceed this share of the set.</summary>
-        public const double MaxDeltaRatio = 0.25;
+        /// <summary>Above this share of changed members since the last snapshot write, a set is written inline into the snapshot
+        /// instead of as a delta (GARNET_SORTEDSET_DELTA_RATIO, default 0.10): measured on cygnus, a delta of ~20% of 1M members took
+        /// longer than writing the set through the snapshot path.</summary>
+        public static readonly double MaxDeltaRatio = double.TryParse(Environment.GetEnvironmentVariable("GARNET_SORTEDSET_DELTA_RATIO"),
+            NumberStyles.Float, CultureInfo.InvariantCulture, out var ratio) ? ratio : 0.10;
 
         /// <summary>The stub's marker in place of the member count.</summary>
         public const int StubMarker = -1;
