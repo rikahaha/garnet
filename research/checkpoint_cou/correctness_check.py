@@ -49,7 +49,9 @@ class Conn:
 def start(extra):
     log = open(f"{WORK}/server.log", "a")
     p = subprocess.Popen([*SERVER_CMD, "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt", "--device-type", "RandomAccess",
-                          "--logger-level", "Information", "-m", "4g", "-i", "64m", *extra],
+                          "--logger-level", "Information", "-m", os.environ.get("MEM", "4g"), "-i", "64m", *extra,
+                          # STORAGE_TIER=1: a real main log device, so evicted records are written to and read back from disk.
+                          *(["--storage-tier", "--logdir", f"{WORK}/log"] if os.environ.get("STORAGE_TIER") == "1" else [])],
                          stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet"})
     for _ in range(600):
         try: c = Conn(); c.cmd("PING"); return p, c

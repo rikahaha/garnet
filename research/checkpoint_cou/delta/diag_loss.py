@@ -3,7 +3,8 @@
 
 Starts Garnet (GARNET_DLL, default the local build) with -m MEM (default 8g) on port 6400, loads and runs the throughput
 benchmark (20 sets x MEMBERS, 16 clients, 50% ZINCRBY) with BGSAVE at SAVEAT, and every 100 ms records each set's ZCARD and the
-store's log addresses / heap size from INFO STORE. Prints when each set first shrinks and the log state around it.
+store's log addresses / heap size from INFO STORE. STORAGE_TIER=1 adds --storage-tier (a real main log device);
+without it the main log is a NullDevice and evicted records are dropped (cache mode). Prints when each set first shrinks and the log state around it.
 
 Usage: diag_loss.py [out_csv]
 """
@@ -46,7 +47,8 @@ def main():
     os.makedirs(WORK)
     log = open(os.path.join(WORK, "server.log"), "w")
     p = subprocess.Popen([DOTNET, GARNET, "--port", str(PORT), "--checkpointdir", os.path.join(WORK, "ckpt"), "--device-type", "RandomAccess",
-                          "--logger-level", "Information", "-m", MEM, "-i", "64m"], stdout=log, stderr=subprocess.STDOUT,
+                          "--logger-level", "Information", "-m", MEM, "-i", "64m"]
+                         + (["--storage-tier", "--logdir", os.path.join(WORK, "log")] if os.environ.get("STORAGE_TIER") == "1" else []), stdout=log, stderr=subprocess.STDOUT,
                          env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet"})
     for _ in range(300):
         try:
@@ -97,7 +99,7 @@ def main():
             for s, n in enumerate(sizes):
                 if n < MEMBERS and s not in first:
                     first[s] = i
-    print(f"MEM={MEM} SAVEAT={SAVEAT}: {len(first)} of 20 sets shrank")
+    print(f"MEM={MEM} SAVEAT={SAVEAT} STORAGE_TIER={os.environ.get('STORAGE_TIER', '0')}: {len(first)} of 20 sets shrank")
     for i in sorted(set(first.values())):
         for j in (i - 1, i):
             t, sizes, info = rows[j]

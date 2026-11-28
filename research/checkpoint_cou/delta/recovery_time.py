@@ -11,8 +11,8 @@ every set has MEMBERS members. An empty restart is timed as the fixed startup co
 
 Usage: recovery_time.py [out_csv]   (env SETS, MEMBERS, REPS, MEM = log memory limit, default 32g)
 
-MEM defaults to 32g: with -m 8g, unmodified Garnet loses sorted set data under this load after ~3 checkpoints
-(see ../upstream_bug/SORTEDSET_LOSS_UNDER_MEMORY_LIMIT.md).
+MEM defaults to 32g: without --storage-tier Garnet is a cache (NullDevice main log), and with -m 8g this load evicts whole
+sorted sets after ~3 checkpoints (see ../upstream_bug/SORTEDSET_LOSS_UNDER_MEMORY_LIMIT.md).
 """
 import os, shutil, signal, socket, subprocess, sys, time
 
