@@ -253,16 +253,18 @@ def listcmp(out):
 
 
 def churn(out):
-    """Checkpoint cost vs the share of members changed between checkpoints: 16 clients, uniform, 6 checkpoints 7 s apart; the
-    write share (100 - readpct) sets how many members change. One run per point."""
+    """Checkpoint cost vs the share of members changed between checkpoints: CHURN_CLIENTS clients (default 16), uniform,
+    6 checkpoints 7 s apart; the write share (100 - readpct) sets how many members change. One run per point."""
     run = os.path.join(HERE, "../throughput/throughput_run.py")
     analyze = os.path.join(HERE, "../throughput/throughput_analyze.py")
     saves = [5 + 7 * i for i in range(6)]
-    for readpct in os.environ.get("CHURN_READPCT", "99 95 80 50 0").split():
+    for clients in os.environ.get("CHURN_CLIENTS", "16").split():
+      for readpct in os.environ.get("CHURN_READPCT", "99 95 80 50 0").split():
         for config in ("baseline", "viewpooled", "delta"):
-            name = f"{out}/churn_{config}_read{readpct}"
+            # 16 clients keep the original names (churn_<config>_read<pct>); other client counts add _c<n>.
+            name = f"{out}/churn_{config}_read{readpct}" if clients == "16" else f"{out}/churn_{config}_c{clients}_read{readpct}"
             env = {**os.environ, **CONFIGS[config], "MEM": MEM}
-            args = ["members=1000000", "sets=20", "clients=16", "pipeline=1", f"readpct={readpct}", f"run={saves[-1] + 5}",
+            args = ["members=1000000", "sets=20", f"clients={clients}", "pipeline=1", f"readpct={readpct}", f"run={saves[-1] + 5}",
                     "saveat=" + ",".join(map(str, saves))]
             subprocess.run([sys.executable, "-I", run, name, *args], env=env, check=True, stderr=subprocess.DEVNULL)
             subprocess.run([sys.executable, "-I", analyze, name], check=True)

@@ -3,15 +3,19 @@
 share of steady, max latency, checkpoint durations, and for delta the members changed between checkpoints and how each set was
 written. Reads <dir>/run_paper.log and <dir>/churn_delta_read*_delta.csv; prints Markdown.
 
-Usage: churn_tables.py <results_dir>
+Usage: churn_tables.py <results_dir> [clients, default 16]
 """
 import csv, os, re, sys
 
 d = sys.argv[1]
 log = open(os.path.join(d, "run_paper.log")).read()
 runs = {}
-for m in re.finditer(r"churn_(\w+?)_read(\d+): .*?durations ms=\[([^\]]*)\]\n((?:\s+(?:steady|ckpt\d).*\n)+)", log):
-    cfg, read, durs, body = m.groups()
+CLIENTS = sys.argv[2] if len(sys.argv) > 2 else "16"
+tag = "" if CLIENTS == "16" else f"_c{CLIENTS}"
+for m in re.finditer(r"churn_(baseline|viewpooled|delta)(_c\d+)?_read(\d+): .*?durations ms=\[([^\]]*)\]\n((?:\s+(?:steady|ckpt\d).*\n)+)", log):
+    cfg, ctag, read, durs, body = m.groups()
+    if (ctag or "") != tag:
+        continue
     lines = {}
     for l in body.strip().split("\n"):
         mm = re.match(r"\s*(\w+)\s+([\d.]+) kops.*?p99\.9=\s*(\d+)\s+max=\s*(\d+)", l)
@@ -25,7 +29,7 @@ names = {"baseline": "原版", "viewpooled": "视图 + 池化", "delta": "增量
 
 
 def changed(read):
-    path = os.path.join(d, f"churn_delta_read{read}_delta.csv")
+    path = os.path.join(d, f"churn_delta{tag}_read{read}_delta.csv")
     if not os.path.exists(path):
         return ""
     rows = [r for r in csv.DictReader(open(path)) if r["written"].startswith("side_delta")]

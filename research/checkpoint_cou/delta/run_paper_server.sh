@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 export GARNET_BIN=$PWD/garnet-bin/GarnetServer BENCH_BIN=$PWD/bench-bin/ThroughputBench RB_BIN=$PWD/rb-bin/Resp.benchmark
 export GARNET_NUMA="numactl --cpunodebind=1 --membind=1" CLIENT_NUMA="numactl --cpunodebind=0 --membind=0"
 export MEM=32g REPS=2
+export CHURN_CLIENTS=${CHURN_CLIENTS:-16}
 export LISTCMP_CONFIGS=${LISTCMP_CONFIGS:-baseline viewpooled delta_scan delta}
 (cd delta && python3 -I paper_eval.py results ${EXPERIMENTS:-zaddrem savetime rounds scaling}) > run_paper.log 2>&1
 touch done.txt
