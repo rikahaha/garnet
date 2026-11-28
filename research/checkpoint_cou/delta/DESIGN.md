@@ -119,3 +119,11 @@
 - 回归：`Garnet.test.collections` 全部 853 个，增量开（阈值 1）和全关两种模式都通过。`Garnet.test`（排除 `MultiTcpSocketTest`）两种模式都是
   1533 通过、同样 4 个失败（`PinnedBasePortThatIsOccupiedFails`、`ListenerIsDetectedOnEveryBoundAddressKind` ×3，本机端口占用检测相关，与开关无关）。
   `MultiTcpSocketTest` 在本机连 IPv6 链路本地地址失败，且失败后不关闭服务器，连带后续测试绑不上端口，所以单独排除。
+
+## 修正（2026-11-29，外部审阅）
+
+- 链文件编号改为每个成员存储单调递增（`AllocateSeq`），丢弃基版本后也不复用；创建文件用 `FileMode.CreateNew`。回归测试
+  `DroppedBaseDoesNotOverwriteTheLastCompletedChain`（上一次完成的链 → 内联重置 → 新链写一半未提交 → 恢复上一次，逐成员核对）和
+  `ExistingChainFileIsNeverOverwritten`；两者在旧行为下都失败。
+- 打开视图不再复制被删 key（O(1)）；写链文件时 `ReadDeletedKeys` 按位置和轮次读取；视图打开期间 `DropBase` 推迟清空列表。
+- 已知限制：侧存储是进程内静态状态，同一进程的多个实例会互相干扰。

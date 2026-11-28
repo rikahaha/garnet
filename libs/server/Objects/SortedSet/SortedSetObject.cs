@@ -425,7 +425,9 @@ namespace Garnet.server
                 || view.ChangedSinceBase + view.DeletedSinceBase > SortedSetSideStore.MaxDeltaRatio * view.Count
                 || !SortedSetSideStore.Exists(uid, store.BaseSeq)
                 || !SortedSetSideStore.Exists(uid, store.ChainStart);
-            var seq = store.BaseSeq + 1;
+            // A delta also needs the base it was opened against to be intact (deleted keys and changes since it are still recorded).
+            full = full || !store.BaseIntact(view);
+            var seq = store.AllocateSeq();  // never reuses a number: a file of the last completed checkpoint's chain may still exist
             var chainStart = full ? seq : store.ChainStart;
 
             // Phase timing (trace only): finding the rows to write (reading the view), encoding them into the file stream, and
@@ -439,8 +441,15 @@ namespace Garnet.server
             {
                 if (!full)
                 {
-                    foreach (var key in view.DeletedKeysSinceBase)
-                        file.Delete(key);
+                    var deleted = new List<byte[]>(1024);
+                    while (true)
+                    {
+                        store.ReadDeletedKeys(view, deleted);
+                        if (deleted.Count == 0)
+                            break;
+                        foreach (var key in deleted)
+                            file.Delete(key);
+                    }
                 }
                 var rows = new List<(byte[] Key, double Score)>(128);
                 // A delta reads only the members changed since the base, from the change list, unless that is off or unavailable.

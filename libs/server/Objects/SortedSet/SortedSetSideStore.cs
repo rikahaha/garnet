@@ -297,7 +297,8 @@ namespace Garnet.server
             {
                 path = PathFor(uid, seq);
                 _ = Directory.CreateDirectory(Path.GetDirectoryName(path));
-                file = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16);
+                // CreateNew: a chain file is never overwritten (one of an earlier chain may still be needed for recovery).
+                file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16);
                 hashing = new HashingStream(file);
                 writer = new BinaryWriter(hashing);
                 writer.Write(Magic);

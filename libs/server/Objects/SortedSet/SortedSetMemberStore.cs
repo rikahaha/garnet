@@ -75,8 +75,9 @@ namespace Garnet.server
             /// <summary>Upper bound on the members changed or added since the base (exact when the base is the previous epoch).</summary>
             public long ChangedSinceBase { get; internal set; }
 
-            /// <summary>Keys deleted since the base, of members that may have existed at the base (delta mode only; else null).</summary>
-            public List<byte[]> DeletedKeysSinceBase { get; internal set; }
+            // Deleted keys of members that may have existed at the base: deletedKeys[0, DeletedEnd) filtered to (BaseEpoch, Epoch],
+            // read by the writer (ReadDeletedKeys) rather than copied when the view opens, so opening stays O(1).
+            internal int DeletedEnd, DeletedIndex;
 
             internal int ChainGeneration;
 
@@ -134,6 +135,13 @@ namespace Garnet.server
 
         /// <summary>Deltas in the chain ending at <see cref="BaseSeq"/>.</summary>
         public int ChainDeltas { get; private set; }
+
+        // The last chain file sequence number handed out. Never goes back, also when the base is dropped: a new chain must not reuse
+        // a number, because the file of that number may still belong to the chain of the last completed checkpoint.
+        long lastSeq;
+
+        /// <summary>A sequence number for the next chain file of this store, larger than any handed out before.</summary>
+        public long AllocateSeq() => Interlocked.Increment(ref lastSeq);
 
         // Bumped when the delta bookkeeping is dropped, so a chain file being written meanwhile does not become a base.
         int chainGeneration;
@@ -240,7 +248,7 @@ namespace Garnet.server
                         deletedKeys.Add((epoch, key));
                         // Bound the retained keys when no snapshot write moves the base (e.g. the record stays below the snapshot range):
                         // drop them and the base, so the next chain file is full.
-                        if (deletedKeys.Count > (live.Count >> 2) + 1024)
+                        if (deletedKeys.Count > (live.Count >> 2) + 1024 && !dropChangesOnClose)
                             DropBase();
                     }
                 }
@@ -292,15 +300,7 @@ namespace Garnet.server
                     if (c.Epoch > baseEpoch && c.Epoch <= epoch)
                         view.ChangedSinceBase += c.Count;
                 }
-                if (deletedKeys is not null)
-                {
-                    view.DeletedKeysSinceBase = new List<byte[]>();
-                    foreach (var d in deletedKeys)
-                    {
-                        if (d.Epoch > baseEpoch && d.Epoch <= epoch)
-                            view.DeletedKeysSinceBase.Add(d.Key);
-                    }
-                }
+                view.DeletedEnd = deletedKeys?.Count ?? 0;  // later entries are epoch > view.Epoch
                 epoch++;
                 lastViewLimit = lastId;
                 view.ChainGeneration = chainGeneration;
@@ -365,6 +365,38 @@ namespace Garnet.server
                 view.ListSeen = new HashSet<long>();
                 return true;
             }
+        }
+
+        /// <summary>
+        /// Read up to <paramref name="max"/> keys deleted since the view's base (of members that may have existed at the base) into
+        /// <paramref name="keys"/> (cleared first); empty when all were read. Only valid while the base the view was opened against is
+        /// intact when the writer starts (<see cref="BaseIntact"/>). A base dropped while the view is open does not clear the list
+        /// until the view closes, so the keys read here stay complete.
+        /// </summary>
+        public void ReadDeletedKeys(View view, List<byte[]> keys, int max = 1024)
+        {
+            keys.Clear();
+            EnterReader();
+            try
+            {
+                Validate(view);
+                if (deletedKeys is null)
+                    throw new InvalidOperationException("This store does not track deleted keys");
+                while (view.DeletedIndex < view.DeletedEnd && keys.Count < max)
+                {
+                    var (e, key) = deletedKeys[view.DeletedIndex++];
+                    if (e > view.BaseEpoch && e <= view.Epoch)
+                        keys.Add(key);
+                }
+            }
+            finally { Monitor.Exit(gate); }
+        }
+
+        /// <summary>Whether the view's base is still intact (no <see cref="DropBase"/> since it opened), so a delta against it is valid.</summary>
+        public bool BaseIntact(View view)
+        {
+            lock (gate)
+                return view.ChainGeneration == chainGeneration && BaseSeq != 0;
         }
 
         /// <summary>Read up to <paramref name="maxMembers"/> changed boundary members (see <see cref="TryBeginChangeListRead"/>).</summary>
@@ -451,11 +483,14 @@ namespace Garnet.server
         {
             BaseSeq = ChainStart = 0;
             ChainDeltas = 0;
-            deletedKeys?.Clear();
             chainGeneration++;
-            // A view may be reading the change list by index: clear it when that view closes.
-            if (active is { Closed: false, ListRead: true }) dropChangesOnClose = true;
-            else changedSlots?.Clear();
+            // An open view may read the deleted keys or the change list by index: clear them when that view closes.
+            if (active is { Closed: false }) dropChangesOnClose = true;
+            else
+            {
+                deletedKeys?.Clear();
+                changedSlots?.Clear();
+            }
         }
 
         /// <summary>Release what the view retained (old scores, deleted members) and close it. Only the captured slots are visited,
@@ -487,6 +522,7 @@ namespace Garnet.server
                     if (dropChangesOnClose)
                     {
                         changedSlots?.Clear();
+                        deletedKeys?.Clear();
                         dropChangesOnClose = false;
                     }
                     return;

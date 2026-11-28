@@ -21,9 +21,9 @@ namespace Garnet.test
     {
         const int Keys = 2000;
 
-        static byte[] K(int i) => Encoding.ASCII.GetBytes($"k{i}");
+        internal static byte[] K(int i) => Encoding.ASCII.GetBytes($"k{i}");
 
-        static Dictionary<string, double> ReadAll(SortedSetMemberStore store, SortedSetMemberStore.View view)
+        internal static Dictionary<string, double> ReadAll(SortedSetMemberStore store, SortedSetMemberStore.View view)
         {
             var result = new Dictionary<string, double>();
             var rows = new List<(byte[] Key, double Score)>();
@@ -44,7 +44,7 @@ namespace Garnet.test
                 Assert.Fail($"{what}: expected {expected.Count}, got {actual.Count}; missing [{string.Join(", ", missing)}] extra [{string.Join(", ", extra)}] wrong [{string.Join(", ", wrong)}]");
         }
 
-        sealed class Model
+        internal sealed class Model
         {
             readonly SortedSetMemberStore store;
             readonly Random rng;
@@ -96,7 +96,7 @@ namespace Garnet.test
             model.Ops(300, hotKeys: 50);  // after the boundary
             var persisted = ReadAll(store, view);
             AssertSame(expected, persisted, "full read");
-            store.CommitChainFile(view, seq: 1, full: true);
+            store.CommitChainFile(view, store.AllocateSeq(), full: true);
             store.Close(view);
 
             var listReads = 0;
@@ -114,12 +114,20 @@ namespace Garnet.test
                     ClassicAssert.AreEqual(0, store.BaseSeq, $"round {round}: change list refused although there is a base");
                     persisted = ReadAll(store, view);
                     AssertSame(expected, persisted, $"round {round} (full)");
-                    store.CommitChainFile(view, seq: round + 2, full: true);
+                    store.CommitChainFile(view, store.AllocateSeq(), full: true);
                     store.Close(view);
                     continue;
                 }
                 listReads++;
-                var deletes = view.DeletedKeysSinceBase.Select(Encoding.ASCII.GetString).ToList();
+                ClassicAssert.IsTrue(store.BaseIntact(view));
+                var deletes = new List<string>();
+                var keyBatch = new List<byte[]>();
+                while (true)
+                {
+                    store.ReadDeletedKeys(view, keyBatch, max: 7);
+                    if (keyBatch.Count == 0) break;
+                    deletes.AddRange(keyBatch.Select(Encoding.ASCII.GetString));
+                }
                 var upserts = new List<(string, double)>();
                 var rows = new List<(byte[] Key, double Score)>();
                 var batches = 0;
@@ -137,7 +145,7 @@ namespace Garnet.test
                 AssertSame(expected, persisted, $"round {round}");
                 ClassicAssert.AreEqual(upserts.Count, upserts.Select(u => u.Item1).Distinct().Count(), "a member was emitted twice");
 
-                store.CommitChainFile(view, seq: round + 2, full: false);
+                store.CommitChainFile(view, store.AllocateSeq(), full: false);
                 store.Close(view);
 
                 // After closing, the store holds exactly the live contents (nothing retained for the view leaks).
