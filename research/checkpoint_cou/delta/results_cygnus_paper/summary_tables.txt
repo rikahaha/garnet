@@ -1,0 +1,27 @@
+ROUNDS, 16 clients. Each checkpoint: duration, throughput as % of steady, max latency ms. rep1 ; rep2
+uniform baseline   758ms 48% max282 ; 608ms 47% max133 | 622ms 48% max254 ; 1147ms 24% max763 | 650ms 45% max236 ; 476ms 57% max98 | 442ms 57% max93 ; 699ms 44% max314 | 945ms 30% max535 ; 538ms 60% max89 | 447ms 55% max97 ; 1112ms 30% max678
+uniform viewpooled 1870ms 94% max128 ; 1956ms 93% max94 | 1035ms 102% max1 ; 1020ms 99% max1 | 1109ms 103% max1 ; 1032ms 100% max1 | 1036ms 103% max0 ; 989ms 101% max1 | 997ms 102% max0 ; 970ms 100% max6 | 1034ms 102% max0 ; 989ms 100% max0
+uniform delta      2413ms 99% max4 ; 2422ms 101% max5 | 557ms 100% max1 ; 592ms 98% max0 | 554ms 102% max0 ; 561ms 100% max0 | 551ms 101% max0 ; 577ms 101% max0 | 551ms 101% max0 ; 577ms 97% max0 | 2113ms 95% max119 ; 2009ms 99% max1
+zipf    baseline   728ms 40% max172 ; 665ms 47% max163 | 1120ms 24% max770 ; 747ms 35% max306 | 443ms 63% max75 ; 683ms 40% max341 | 468ms 52% max78 ; 530ms 48% max102 | 484ms 53% max100 ; 458ms 64% max71 | 447ms 65% max75 ; 396ms 63% max77
+zipf    viewpooled 1625ms 101% max4 ; 1838ms 84% max297 | 998ms 100% max1 ; 1013ms 101% max1 | 975ms 103% max0 ; 999ms 99% max1 | 965ms 102% max0 ; 963ms 101% max0 | 1040ms 101% max1 ; 964ms 101% max0 | 1213ms 89% max168 ; 982ms 101% max0
+zipf    delta      2399ms 101% max4 ; 2409ms 102% max5 | 494ms 103% max0 ; 491ms 104% max0 | 488ms 100% max0 ; 583ms 87% max102 | 489ms 100% max0 ; 470ms 104% max1 | 483ms 98% max11 ; 472ms 103% max0 | 1976ms 101% max0 ; 2006ms 101% max1
+
+SCALING. steady kops, then ckpt1 | ckpt2. rep1 || rep2
+uniform c16  baseline      438  872ms 34% max339 | 634ms 49% max186  ||     434  637ms 44% max165 | 813ms 39% max306
+uniform c16  viewpooled    444  1817ms 97% max64 | 1094ms 101% max0  ||     448  1894ms 91% max106 | 1004ms 102% max0
+uniform c16  delta         443  2423ms 100% max9 | 804ms 72% max240  ||     436  2360ms 102% max4 | 585ms 103% max0
+uniform c64  baseline     1425  1169ms 31% max448 | 581ms 54% max258  ||    1143  792ms 60% max306 | 746ms 48% max334
+uniform c64  viewpooled   1409  1912ms 101% max9 | 1476ms 101% max9  ||    1450  2210ms 76% max154 | 1744ms 82% max276
+uniform c64  delta        1354  3379ms 91% max159 | 1142ms 103% max8  ||    1425  2977ms 101% max12 | 1442ms 84% max234
+uniform c128 baseline     1492  1210ms 36% max808 | 666ms 42% max281  ||    1444  787ms 56% max408 | 739ms 44% max374
+uniform c128 viewpooled   1433  2228ms 98% max159 | 1561ms 114% max19  ||    1650  2125ms 88% max83 | 1897ms 76% max184
+uniform c128 delta        1703  3202ms 93% max182 | 1921ms 62% max659  ||    1559  3388ms 92% max149 | 1271ms 101% max20
+zipf    c16  baseline      430  718ms 41% max273 | 645ms 45% max212  ||     438  651ms 32% max168 | 799ms 35% max256
+zipf    c16  viewpooled    439  1778ms 96% max87 | 1018ms 100% max0  ||     442  1787ms 97% max57 | 1044ms 100% max0
+zipf    c16  delta         448  2367ms 99% max4 | 485ms 101% max0  ||     438  2271ms 101% max5 | 489ms 99% max0
+zipf    c64  baseline     1308  768ms 53% max338 | 778ms 40% max714  ||    1240  1266ms 34% max664 | 724ms 53% max296
+zipf    c64  viewpooled   1435  1991ms 92% max103 | 1469ms 98% max318  ||    1448  2198ms 84% max138 | 1613ms 87% max153
+zipf    c64  delta        1247  3304ms 109% max111 | 924ms 113% max11  ||    1347  2992ms 103% max9 | 895ms 104% max15
+zipf    c128 baseline     1518  1474ms 29% max1075 | 706ms 55% max335  ||    1660  1011ms 40% max604 | 1355ms 29% max991
+zipf    c128 viewpooled   1657  2126ms 76% max244 | 1527ms 98% max23  ||    1615  2356ms 78% max248 | 1496ms 98% max23
+zipf    c128 delta        1633  3448ms 93% max245 | 1006ms 98% max13  ||    1554  3173ms 107% max39 | 1002ms 99% max24

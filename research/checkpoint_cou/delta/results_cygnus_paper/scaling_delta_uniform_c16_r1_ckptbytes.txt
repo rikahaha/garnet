@@ -1,0 +1,3 @@
+cpr-checkpoints 3072
+index-checkpoints 67110400
+sortedset-members 427280511

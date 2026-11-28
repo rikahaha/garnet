@@ -1,0 +1,7 @@
+config,rep,first_ms,second_ms,side_full_bytes,side_delta_bytes
+baseline,1,1221,932,0,0
+viewpooled,1,1318,977,0,0
+delta,1,2171,374,397778960,3978914
+baseline,2,1220,933,0,0
+viewpooled,2,1464,982,0,0
+delta,2,2383,372,397778960,3979055

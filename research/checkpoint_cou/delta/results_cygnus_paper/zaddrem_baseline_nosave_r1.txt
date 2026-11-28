@@ -1,0 +1,44 @@
+<<<<<<< Benchmark Configuration >>>>>>>>
+benchmarkType: Throughput
+skipLoad: Disabled
+DBsize: 1024
+TotalOps: 33554432
+Op Benchmark: ZADDREM
+KeyLength: 8
+ValueLength: 8
+BatchSize: 1024
+RunTime: 10
+NumThreads: 1,4,16,64
+Auth: 
+Load Using SET: Disabled
+ClientType used for benchmarking: LightClient
+TLS: Disabled
+ClientHistogram: False
+minWorkerThreads: 1000
+minCompletionPortThreads: 1000
+----------------------------------
+
+Generating 32768 ZADDREM request batches of size 1024 each; total 33554432 ops
+Request generation complete
+maxBytesWritten out of maxBufferSize: 42380/65536
+Loading time: 5.83 secs
+
+Operation type: ZADDREM
+Num threads: 1
+[Total time]: 10,000.00ms for 11,975,680.00 ops
+[Throughput]: 1,197,568.00 ops/sec
+
+Operation type: ZADDREM
+Num threads: 4
+[Total time]: 10,000.00ms for 39,652,352.00 ops
+[Throughput]: 3,965,235.20 ops/sec
+
+Operation type: ZADDREM
+Num threads: 16
+[Total time]: 10,001.00ms for 128,280,576.00 ops
+[Throughput]: 12,826,774.92 ops/sec
+
+Operation type: ZADDREM
+Num threads: 64
+[Total time]: 10,005.00ms for 240,658,432.00 ops
+[Throughput]: 24,053,816.29 ops/sec
