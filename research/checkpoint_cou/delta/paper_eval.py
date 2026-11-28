@@ -239,7 +239,7 @@ def listcmp(out):
     configs = {**CONFIGS, "delta_scan": DELTA_SCAN}
     for rep in range(1, REPS + 1):
         for clients in os.environ.get("LISTCMP_CLIENTS", "16 64 128").split():
-            for config in ("baseline", "viewpooled", "delta_scan", "delta"):
+            for config in os.environ.get("LISTCMP_CONFIGS", "baseline viewpooled delta_scan delta").split():
                 name = f"{out}/listcmp_{config}_c{clients}_r{rep}"
                 env = {**os.environ, **configs[config], "MEM": MEM}
                 args = ["members=1000000", "sets=20", f"clients={clients}", "pipeline=1", "readpct=50", f"run={saves[-1] + 5}",
