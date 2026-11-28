@@ -350,8 +350,11 @@ namespace Garnet.server
             try
             {
                 // Delta mode: a large set flushed into a snapshot file goes to the side store, and the snapshot gets a stub. Anything
-                // else (the main log, small sets) gets the members inline, exactly as DoSerialize writes them.
-                if (HeapObjectBase.InSnapshotFlush && SortedSetSideStore.Enabled && view.Count >= SortedSetSideStore.MinMembers)
+                // else (the main log, small sets) gets the members inline, exactly as DoSerialize writes them. So does a set that changed
+                // in more than a quarter of its members since the last snapshot write: a delta would save little, and the snapshot's
+                // own write path is faster than a full chain file (the next low-change checkpoint starts a new chain).
+                var highChurn = view.ChangedSinceBase + view.DeletedSinceBase > SortedSetSideStore.MaxDeltaRatio * view.Count;
+                if (HeapObjectBase.InSnapshotFlush && SortedSetSideStore.Enabled && view.Count >= SortedSetSideStore.MinMembers && !highChurn)
                 {
                     WriteViewToSideStore(writer, view);
                     return true;

@@ -6,8 +6,8 @@ Runs the local Garnet build with GARNET_SORTEDSET_MEMBER_CHECKPOINT=1 GARNET_SOR
   chain     Scenario C of correctness_check.py with 7 checkpoints (one writer through all of them, kill -9, recover without AOF):
             the recovered state must be a consistent prefix. Also checks that deltas were written, that a chain was cut by a
             full file after 4 deltas, and that afterwards only the chain referenced by the last checkpoint is left.
-  restart   Checkpoints with deltas, DEL and re-create a set, checkpoint, kill, recover; then write, checkpoint twice more (the
-            first after recovery must be full), kill, recover again. No writes after each final checkpoint, so the recovered
+  restart   Checkpoints with deltas, DEL and re-create a set, checkpoint, kill, recover; then write, checkpoint three more times
+            (inline, full chain files, deltas), kill, recover again. No writes after each final checkpoint, so the recovered
             contents must equal the contents at that checkpoint exactly. Files of the deleted set must be gone.
   crash     Kill -9 at random moments while a checkpoint with deltas is in flight (no writes after BGSAVE): recovery must give
             exactly the state of the previous or of the in-flight checkpoint.
@@ -136,19 +136,20 @@ def scenario_restart():
     p, c = cc.start(["--recover"])
     ok = check("recover after DEL + re-create", contents(c, sets) == expected)
     uids_after = {u for u, _ in side_files()}
-    ok &= check("files of the deleted set removed", len(uids_after) == len(sets) and len(uids_before - uids_after) == 1,
+    # The re-created set is all new members, so it was written inline (no chain); the deleted set's chain must be gone.
+    ok &= check("files of the deleted set removed", len(uids_after) <= len(sets) and len(uids_before - uids_after) == 1,
                 f"{len(uids_before)} stores before, {len(uids_after)} after, {len(uids_before - uids_after)} gone")
 
-    n_rows = len(trace_rows())
-    mutate(c, rng, sets, members, 400)
-    bgsave(c)
-    first = [r["written"] for r in trace_rows()[n_rows:] if r["written"].startswith("side_")]
-    ok &= check("first checkpoint after recovery writes full files", bool(first) and all(k == "side_full" for k in first), str(first))
-    n_rows = len(trace_rows())
-    mutate(c, rng, sets, members, 400)
-    bgsave(c)
-    second = [r["written"] for r in trace_rows()[n_rows:] if r["written"].startswith("side_")]
-    ok &= check("second writes deltas", bool(second) and all(k.startswith("side_delta") for k in second), str(second))
+    # After recovery every member counts as new (high change), so the first checkpoint writes the sets inline into the snapshot;
+    # the next one starts a chain with full files, and the one after writes deltas.
+    kinds = []
+    for _ in range(3):
+        n_rows = len(trace_rows())
+        mutate(c, rng, sets, members, 400)
+        bgsave(c)
+        kinds.append(sorted({r["written"] for r in trace_rows()[n_rows:] if r["written"] not in ("inline_mainlog", "written")}))
+    ok &= check("after recovery: inline, then full chain files, then deltas",
+                kinds[0] == ["inline"] and kinds[1] == ["side_full"] and len(kinds[2]) == 1 and kinds[2][0].startswith("side_delta"), str(kinds))
     expected = contents(c, sets)
     cc.kill(p)
     p, c = cc.start(["--recover"])
