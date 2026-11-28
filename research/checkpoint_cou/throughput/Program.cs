@@ -8,7 +8,8 @@ using System.Text.Json;
 // Loads `sets` sorted sets z0..z{sets-1} of `members` members m0..m{members-1} (score = index), then runs `clients`
 // connections for `run` seconds. Each connection sends `pipeline` commands, waits for all replies, and repeats. A command
 // picks a set and an existing member uniformly at random and is ZSCORE with probability `readpct`%, else ZINCRBY by 1, so
-// set sizes stay constant. BGSAVE is issued at the `saveat` offsets (seconds). Output (JSON on stdout): completed operations
+// set sizes stay constant. With `zipf`=<theta> (e.g. 0.9) the member is drawn from a Zipf(theta) distribution over ranks
+// instead, with ranks mapped to members by a fixed random permutation (the same hot members for every client). BGSAVE is issued at the `saveat` offsets (seconds). Output (JSON on stdout): completed operations
 // per 10 ms, and per 100 ms a log-scale latency histogram (5% bins) with the exact maximum. Every operation of a batch is
 // charged the batch's latency. Times are relative to `startUnixMs` so they can be aligned with the server's checkpoint trace.
 static class Program
@@ -27,6 +28,26 @@ static class Program
         double runS = double.Parse(Get("run", "20"));
         var saveAt = Get("saveat", "5,12").Split(',', StringSplitOptions.RemoveEmptyEntries).Select(double.Parse).ToArray();
         bool load = Get("load", "true") == "true";
+        double zipf = double.Parse(Get("zipf", "0"));
+
+        // Zipf: cumulative weights over ranks 1..members, and a fixed rank -> member permutation.
+        double[]? zipfCdf = null;
+        int[]? zipfPerm = null;
+        if (zipf > 0)
+        {
+            zipfCdf = new double[members];
+            double acc = 0;
+            for (var r = 0; r < members; r++) zipfCdf[r] = acc += 1.0 / Math.Pow(r + 1, zipf);
+            for (var r = 0; r < members; r++) zipfCdf[r] /= acc;
+            zipfPerm = Enumerable.Range(0, members).ToArray();
+            new Random(42).Shuffle(zipfPerm);
+        }
+        int PickMember(Random rng)
+        {
+            if (zipfCdf is null) return rng.Next(members);
+            var i = Array.BinarySearch(zipfCdf, rng.NextDouble());
+            return zipfPerm![Math.Min(members - 1, i < 0 ? ~i : i)];
+        }
 
         if (load)
         {
@@ -70,7 +91,7 @@ static class Program
                 if (start >= endTicks) break;
                 for (var i = 0; i < pipeline; i++)
                 {
-                    int s = rng.Next(sets), m = rng.Next(members);
+                    int s = rng.Next(sets), m = PickMember(rng);
                     if (rng.Next(100) < readPct) c.Begin(3).Bulk("ZSCORE").Bulk($"z{s}").Bulk($"m{m}");
                     else c.Begin(4).Bulk("ZINCRBY").Bulk($"z{s}").Bulk(1).Bulk($"m{m}");
                 }
@@ -122,7 +143,7 @@ static class Program
         }
         Console.WriteLine(JsonSerializer.Serialize(new
         {
-            sets, members, clients, pipeline, readPct, runS, startUnixMs, saveIssuedMs = saves, timelineMs = TimelineMs, histMs = HistMs,
+            sets, members, clients, pipeline, readPct, zipf, runS, startUnixMs, saveIssuedMs = saves, timelineMs = TimelineMs, histMs = HistMs,
             binBase = 1.05, totalOps = mergedTimeline.Sum(), timeline = mergedTimeline, hist = histOut,
         }));
         return 0;
