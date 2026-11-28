@@ -23,14 +23,19 @@ namespace Garnet.server
             if (string.IsNullOrEmpty(path))
                 return;
             writer = new StreamWriter(path, append: true) { AutoFlush = true };
-            writer.WriteLine("unix_ms,object,members,changed,deleted,base_epoch,full_bytes,delta_bytes,written,file_bytes");
+            writer.WriteLine("unix_ms,object,members,changed,deleted,base_epoch,full_bytes,delta_bytes,written,file_bytes,scanned,scan_us,encode_us,commit_us,fsync_us,total_us");
             Enabled = true;
         }
 
-        public static void Record(object obj, long members, long changed, long deleted, int baseEpoch, long fullBytes, long deltaBytes, string written, long fileBytes)
+        /// <summary>Phase timing of a side store write: members read from the view, time reading them (finding the rows to write),
+        /// encoding rows into the file stream, committing the file (of which fsync), and the whole write.</summary>
+        public readonly record struct Phases(long Scanned, double ScanUs, double EncodeUs, double CommitUs, double FsyncUs, double TotalUs);
+
+        public static void Record(object obj, long members, long changed, long deleted, int baseEpoch, long fullBytes, long deltaBytes, string written, long fileBytes,
+            Phases phases = default)
         {
             var line = FormattableString.Invariant(
-                $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()},{obj.GetType().Name}:{obj.GetHashCode():x},{members},{changed},{deleted},{baseEpoch},{fullBytes},{deltaBytes},{written},{fileBytes}");
+                $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()},{obj.GetType().Name}:{obj.GetHashCode():x},{members},{changed},{deleted},{baseEpoch},{fullBytes},{deltaBytes},{written},{fileBytes},{phases.Scanned},{phases.ScanUs:F0},{phases.EncodeUs:F0},{phases.CommitUs:F0},{phases.FsyncUs:F0},{phases.TotalUs:F0}");
             lock (writerLock)
                 writer.WriteLine(line);
         }

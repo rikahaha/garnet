@@ -206,6 +206,7 @@ namespace Garnet.server
             this.serverOptions = serverOptions;
             // Research prototype (ckpt-delta): where sorted set checkpoint stubs point (DB 0's checkpoint directory). Not in cluster mode;
             // writing stops once another database is checkpointed. Stubs are read whenever a recovered snapshot contains them.
+            GcTrace.StartIfConfigured();
             if (!serverOptions.EnableCluster)
                 SortedSetSideStore.Configure(System.IO.Path.Combine(serverOptions.GetStoreCheckpointDirectory(0), "sortedset-members"),
                     allowWrite: true);

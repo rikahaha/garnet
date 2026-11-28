@@ -425,7 +425,13 @@ namespace Garnet.server
             var seq = store.BaseSeq + 1;
             var chainStart = full ? seq : store.ChainStart;
 
-            long changedCount = 0, fileBytes;
+            // Phase timing (trace only): finding the rows to write (reading the view), encoding them into the file stream, and
+            // committing the file (trailer, write-out, fsync).
+            var timed = SortedSetDeltaTrace.Enabled;
+            long tStart = timed ? Stopwatch.GetTimestamp() : 0, scanTicks = 0, encodeTicks = 0, commitTicks = 0;
+            long changedCount = 0, fileBytes, read = 0;
+            double fsyncUs;
+            var listRead = false;
             using (var file = SortedSetSideStore.CreateWriter(uid, seq, full, full ? 0 : store.BaseSeq, chainStart))
             {
                 if (!full)
@@ -434,25 +440,43 @@ namespace Garnet.server
                         file.Delete(key);
                 }
                 var rows = new List<(byte[] Key, double Score)>(128);
-                var changed = full ? null : new List<bool>(128);
-                var read = 0;
-                while (!store.Done(view))
+                // A delta reads only the members changed since the base, from the change list, unless that is off or unavailable.
+                listRead = !full && SortedSetMemberStore.ListMode && store.TryBeginChangeListRead(view);
+                var changed = full || listRead ? null : new List<bool>(128);
+                while (true)
                 {
-                    store.ReadInto(view, rows, changed: changed);
+                    var t0 = timed ? Stopwatch.GetTimestamp() : 0;
+                    if (store.Done(view))
+                        break;
+                    if (listRead)
+                        store.ReadChanged(view, rows);
+                    else
+                        store.ReadInto(view, rows, changed: changed);
+                    var t1 = timed ? Stopwatch.GetTimestamp() : 0;
                     for (var i = 0; i < rows.Count; i++)
                     {
-                        if (full || changed[i])
+                        if (full || listRead || changed[i])
                         {
                             file.Upsert(rows[i].Key, rows[i].Score);
                             changedCount++;
                         }
                     }
                     read += rows.Count;
+                    if (timed)
+                    {
+                        var t2 = Stopwatch.GetTimestamp();
+                        scanTicks += t1 - t0;
+                        encodeTicks += t2 - t1;
+                    }
                 }
-                if (read != view.Count)
+                if (!listRead && read != view.Count)
                     throw new InvalidOperationException($"Snapshot view read {read} members, expected {view.Count}");
+                var tc = timed ? Stopwatch.GetTimestamp() : 0;
                 file.Commit();
+                if (timed)
+                    commitTicks = Stopwatch.GetTimestamp() - tc;
                 fileBytes = file.Length;
+                fsyncUs = file.FsyncUs;
             }
 
             // The file is on disk: it is the base for the next chain file, and this checkpoint's stub refers to its chain.
@@ -465,9 +489,13 @@ namespace Garnet.server
             writer.Write(seq);
             writer.Write(view.Count);
 
-            if (SortedSetDeltaTrace.Enabled)
+            if (timed)
+            {
+                static double Us(long ticks) => ticks * 1e6 / Stopwatch.Frequency;
                 SortedSetDeltaTrace.Record(store, view.Count, changedCount, full ? 0 : view.DeletedSinceBase, view.BaseEpoch, 0, 0,
-                    full ? "side_full" : "side_delta", fileBytes);
+                    full ? "side_full" : listRead ? "side_delta_list" : "side_delta", fileBytes,
+                    new SortedSetDeltaTrace.Phases(read, Us(scanTicks), Us(encodeTicks), Us(commitTicks), fsyncUs, Us(Stopwatch.GetTimestamp() - tStart)));
+            }
         }
 
         /// <inheritdoc />

@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Hashing;
 using Garnet.common;
 
 namespace Garnet.server
@@ -17,7 +18,7 @@ namespace Garnet.server
     /// <remarks>
     /// <para>Layout: <c>&lt;checkpoint dir&gt;/sortedset-members/&lt;uid as 16 hex digits&gt;/&lt;seq as 12 digits&gt;.m</c>.</para>
     /// <para>File: header (magic, version, kind, uid, seq, base seq, chain start), then entries (tag 1: upsert key and score; tag 2: delete
-    /// key), then tag 0, the entry count and an FNV-1a 64 checksum of everything before it. A delta applies its deletes before its
+    /// key), then tag 0, the entry count and an XxHash64 checksum of everything before it. A delta applies its deletes before its
     /// upserts, so a member deleted and added again in one delta ends up present.</para>
     /// <para>Ordering: a file is written and flushed to disk on the snapshot flush thread before the stub that refers to it is written
     /// into the snapshot file, and the checkpoint commits only after its snapshot flush completes. So a committed stub always refers to
@@ -236,7 +237,7 @@ namespace Garnet.server
         static void Apply(long uid, long seq, Dictionary<byte[], double> members)
         {
             var path = PathFor(uid, seq);
-            using var hashing = new Fnv64Stream(new BufferedStream(File.OpenRead(path), 1 << 16));
+            using var hashing = new HashingStream(new BufferedStream(File.OpenRead(path), 1 << 16));
             using var reader = new BinaryReader(hashing);
             try
             {
@@ -278,7 +279,7 @@ namespace Garnet.server
         {
             readonly string path;
             readonly FileStream file;
-            readonly Fnv64Stream hashing;
+            readonly HashingStream hashing;
             readonly BinaryWriter writer;
             long entries;
             bool committed;
@@ -286,12 +287,15 @@ namespace Garnet.server
             /// <summary>Bytes written so far.</summary>
             public long Length => hashing.Position;
 
+            /// <summary>Time of the fsync in <see cref="Commit"/>, in microseconds.</summary>
+            public double FsyncUs { get; private set; }
+
             internal Writer(long uid, long seq, bool full, long baseSeq, long chainStart)
             {
                 path = PathFor(uid, seq);
                 _ = Directory.CreateDirectory(Path.GetDirectoryName(path));
                 file = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16);
-                hashing = new Fnv64Stream(file);
+                hashing = new HashingStream(file);
                 writer = new BinaryWriter(hashing);
                 writer.Write(Magic);
                 writer.Write(Version);
@@ -330,7 +334,10 @@ namespace Garnet.server
                 var checksum = hashing.Hash;
                 writer.Write(checksum);
                 writer.Flush();
+                file.Flush();  // write out the buffered tail, then fsync separately so its time can be measured
+                var t = System.Diagnostics.Stopwatch.GetTimestamp();
                 file.Flush(flushToDisk: true);
+                FsyncUs = (System.Diagnostics.Stopwatch.GetTimestamp() - t) * 1e6 / System.Diagnostics.Stopwatch.Frequency;
                 committed = true;
             }
 
@@ -345,24 +352,20 @@ namespace Garnet.server
             }
         }
 
-        /// <summary>Pass-through stream that keeps an FNV-1a 64 hash of the bytes read or written.</summary>
-        sealed class Fnv64Stream : Stream
+        /// <summary>Pass-through stream that keeps an XxHash64 of the bytes read or written.</summary>
+        sealed class HashingStream : Stream
         {
-            const ulong Offset = 14695981039346656037UL, Prime = 1099511628211UL;
             readonly Stream inner;
-            ulong hash = Offset;
+            readonly XxHash64 hasher = new();
             long position;
 
-            public Fnv64Stream(Stream inner) => this.inner = inner;
+            public HashingStream(Stream inner) => this.inner = inner;
 
-            public ulong Hash => hash;
+            public ulong Hash => hasher.GetCurrentHashAsUInt64();
 
             void Update(ReadOnlySpan<byte> data)
             {
-                var h = hash;
-                foreach (var b in data)
-                    h = (h ^ b) * Prime;
-                hash = h;
+                hasher.Append(data);
                 position += data.Length;
             }
 

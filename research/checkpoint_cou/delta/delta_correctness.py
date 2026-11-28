@@ -100,6 +100,8 @@ def scenario_chain():
     by_set = {}
     for r in rows:
         by_set.setdefault(r["object"], []).append(r["written"])
+    kinds = [k.replace("side_delta_list", "side_delta") for k in kinds]  # change-list reads count as deltas
+    by_set = {o: [k.replace("side_delta_list", "side_delta") for k in v] for o, v in by_set.items()}
     ok &= check("deltas written", kinds.count("side_delta") > 0, f"{kinds.count('side_full')} full, {kinds.count('side_delta')} delta files")
     cut = any(seq[:6] == ["side_full"] + ["side_delta"] * 4 + ["side_full"] for seq in by_set.values())
     ok &= check("chain cut by a full file after 4 deltas", cut, str(next(iter(by_set.values()), [])))
@@ -146,7 +148,7 @@ def scenario_restart():
     mutate(c, rng, sets, members, 400)
     bgsave(c)
     second = [r["written"] for r in trace_rows()[n_rows:] if r["written"].startswith("side_")]
-    ok &= check("second writes deltas", bool(second) and all(k == "side_delta" for k in second), str(second))
+    ok &= check("second writes deltas", bool(second) and all(k.startswith("side_delta") for k in second), str(second))
     expected = contents(c, sets)
     cc.kill(p)
     p, c = cc.start(["--recover"])

@@ -35,7 +35,11 @@ namespace Garnet.server
 
         const int SegmentShift = 12, SegmentSize = 1 << SegmentShift, SegmentMask = SegmentSize - 1;
         const int None = -1;
-        const byte LiveFlag = 1, HasOldFlag = 2;
+        const byte LiveFlag = 1, HasOldFlag = 2, CapturedFlag = 4;
+
+        /// <summary>Delta writes read only the members changed since the base (from the change list) instead of scanning every
+        /// boundary member (GARNET_SORTEDSET_DELTA_LIST, default on; "0" scans, for comparison).</summary>
+        public static readonly bool ListMode = Environment.GetEnvironmentVariable("GARNET_SORTEDSET_DELTA_LIST") != "0";
 
         // Every array stays below the 85,000-byte large-object threshold.
         sealed class Segment
@@ -76,6 +80,12 @@ namespace Garnet.server
 
             internal int ChainGeneration;
 
+            // Change-list read (delta writes): read changes[0, ChangesEnd) instead of following the chain. While set, every boundary
+            // member is pending (no cursor), so changed and deleted members keep their boundary data until the view closes.
+            internal bool ListRead;
+            internal int ChangesEnd, ListIndex;
+            internal HashSet<long> ListSeen;
+
             /// <summary>Number of members at the boundary.</summary>
             public int Count { get; }
 
@@ -106,6 +116,12 @@ namespace Garnet.server
         readonly List<(int Epoch, long Count)> changes;
         readonly List<(int Epoch, byte[] Key)> deletedKeys;  // delta mode only
 
+        // Delta mode: each member's first change in an epoch (insertions included), pruned up to the base; and the slots that keep
+        // boundary data for the open view (old score, or a deleted member), released when the view closes.
+        readonly List<(int Epoch, int Slot, long Id)> changedSlots;
+        readonly List<int> captured;
+        bool dropChangesOnClose;
+
         /// <summary>Random id of this store, naming its chain in the side store.</summary>
         public long Uid { get; } = Random.Shared.NextInt64(1, long.MaxValue);
 
@@ -126,7 +142,10 @@ namespace Garnet.server
         public SortedSetMemberStore() : this(MemberMode) { }
 
         /// <summary>Create an empty store.</summary>
-        public SortedSetMemberStore(bool memberMode)
+        public SortedSetMemberStore(bool memberMode) : this(memberMode, SortedSetSideStore.DeltaMode) { }
+
+        /// <summary>Create an empty store; <paramref name="trackChanges"/> keeps the delta bookkeeping (deleted keys, change list).</summary>
+        public SortedSetMemberStore(bool memberMode, bool trackChanges)
         {
             if (memberMode)
             {
@@ -135,8 +154,12 @@ namespace Garnet.server
                 gate = new object();
                 deletes = new List<(int, long, long)>();
                 changes = new List<(int, long)>();
-                if (SortedSetSideStore.DeltaMode)
+                captured = new List<int>();
+                if (trackChanges)
+                {
                     deletedKeys = new List<(int, byte[])>();
+                    changedSlots = new List<(int, int, long)>();
+                }
             }
             else
                 plain = new Dictionary<byte[], double>(ByteArrayComparer.Instance);
@@ -224,6 +247,7 @@ namespace Garnet.server
                 _ = live.Remove(key);
                 Flags(slot) &= unchecked((byte)~LiveFlag);
                 if (!Pending(slot)) Release(slot);
+                else MarkCaptured(slot);  // retained for the view until the reader passes it or the view closes
                 return true;
             }
             finally { Monitor.Exit(gate); }
@@ -280,6 +304,7 @@ namespace Garnet.server
                 epoch++;
                 lastViewLimit = lastId;
                 view.ChainGeneration = chainGeneration;
+                view.ChangesEnd = changedSlots?.Count ?? 0;  // later entries are epoch > view.Epoch
                 Volatile.Write(ref active, view);
                 return view;
             }
@@ -295,6 +320,8 @@ namespace Garnet.server
             try
             {
                 Validate(view);
+                if (view.ListRead)
+                    throw new InvalidOperationException("View is being read from the change list");
                 while (view.Cursor != None && Id(view.Cursor) <= view.Limit && rows.Count < maxMembers)
                 {
                     var slot = view.Cursor;
@@ -303,7 +330,7 @@ namespace Garnet.server
                     rows.Add((Key(slot), hasOld ? OldScore(slot) : Score(slot)));
                     changed?.Add((hasOld ? OldModEpoch(slot) : ModEpoch(slot)) > view.BaseEpoch);
                     view.Cursor = Next(slot);  // read before Release clears the links
-                    Flags(slot) = (byte)(flags & ~HasOldFlag);
+                    Flags(slot) = (byte)(flags & ~(HasOldFlag | CapturedFlag));
                     if ((flags & LiveFlag) == 0) Release(slot);
                 }
                 // Never keep a cursor on a slot added after the boundary: it can be released and reused at once.
@@ -316,7 +343,58 @@ namespace Garnet.server
         public bool Done(View view)
         {
             EnterReader();
-            try { Validate(view); return view.Cursor == None; }
+            try { Validate(view); return view.ListRead ? view.ListIndex >= view.ChangesEnd : view.Cursor == None; }
+            finally { Monitor.Exit(gate); }
+        }
+
+        /// <summary>
+        /// Switch an unread view to reading only the members changed since its base (delta writes): afterwards
+        /// <see cref="ReadChanged"/> returns each boundary member whose boundary value changed in (base, boundary], once.
+        /// </summary>
+        /// <returns>False if the change list cannot serve this view (not delta mode, already reading, or the list was dropped).</returns>
+        public bool TryBeginChangeListRead(View view)
+        {
+            lock (gate)
+            {
+                Validate(view);
+                // No base (never written, or dropped with the change list): a delta has nothing to apply to.
+                if (changedSlots is null || BaseSeq == 0 || view.ListRead || view.Cursor != head || view.ChainGeneration != chainGeneration)
+                    return false;
+                view.ListRead = true;
+                view.ListIndex = 0;
+                view.ListSeen = new HashSet<long>();
+                return true;
+            }
+        }
+
+        /// <summary>Read up to <paramref name="maxMembers"/> changed boundary members (see <see cref="TryBeginChangeListRead"/>).</summary>
+        public void ReadChanged(View view, List<(byte[] Key, double Score)> rows, int maxMembers = 128)
+        {
+            rows.Clear();
+            EnterReader();
+            try
+            {
+                Validate(view);
+                if (!view.ListRead)
+                    throw new InvalidOperationException("View is not reading from the change list");
+                var scanned = 0;
+                while (view.ListIndex < view.ChangesEnd && rows.Count < maxMembers && scanned < 4 * maxMembers)
+                {
+                    var (e, slot, id) = changedSlots[view.ListIndex++];
+                    scanned++;
+                    if (e <= view.BaseEpoch || e > view.Epoch || id > view.Limit || !view.ListSeen.Add(id))
+                        continue;
+                    // The slot must still hold this member: live, or deleted after the boundary and retained for the view.
+                    var flags = Flags(slot);
+                    if (Id(slot) != id || (flags & (LiveFlag | CapturedFlag)) == 0)
+                        continue;
+                    var hasOld = (flags & HasOldFlag) != 0;
+                    var modEpoch = hasOld ? OldModEpoch(slot) : ModEpoch(slot);
+                    if (modEpoch <= view.BaseEpoch || modEpoch > view.Epoch)
+                        continue;
+                    rows.Add((Key(slot), hasOld ? OldScore(slot) : Score(slot)));
+                }
+            }
             finally { Monitor.Exit(gate); }
         }
 
@@ -330,6 +408,14 @@ namespace Garnet.server
                 _ = deletes.RemoveAll(d => d.Epoch <= baseEpoch);
                 _ = changes.RemoveAll(c => c.Epoch <= baseEpoch);
                 _ = deletedKeys?.RemoveAll(d => d.Epoch <= baseEpoch);
+                if (changedSlots is not null && view.ListRead)
+                {
+                    // Entries up to the base are no longer needed; later ones (after this view's boundary) are kept.
+                    _ = changedSlots.RemoveAll(c => c.Epoch <= baseEpoch);
+                    view.ChangesEnd = view.ListIndex = 0;
+                }
+                else
+                    _ = changedSlots?.RemoveAll(c => c.Epoch <= baseEpoch);
             }
         }
 
@@ -367,18 +453,45 @@ namespace Garnet.server
             ChainDeltas = 0;
             deletedKeys?.Clear();
             chainGeneration++;
+            // A view may be reading the change list by index: clear it when that view closes.
+            if (active is { Closed: false, ListRead: true }) dropChangesOnClose = true;
+            else changedSlots?.Clear();
         }
 
-        /// <summary>Drain what the reader has not read, releasing retained members and old scores, and close the view.</summary>
+        /// <summary>Release what the view retained (old scores, deleted members) and close it. Only the captured slots are visited,
+        /// in batches that let writers through, so closing does not scan the set.</summary>
         public void Close(View view)
         {
-            var rows = new List<(byte[], double)>(128);
-            while (!Done(view)) ReadInto(view, rows);
-            lock (gate)
+            var index = 0;
+            while (true)
             {
-                Validate(view);
-                view.Closed = true;
-                Volatile.Write(ref active, null);
+                EnterReader();
+                try
+                {
+                    Validate(view);
+                    var end = Math.Min(captured.Count, index + 1024);
+                    for (; index < end; index++)
+                    {
+                        var slot = captured[index];
+                        var flags = Flags(slot);
+                        if ((flags & CapturedFlag) == 0) continue;  // already released by the reader (and maybe reused)
+                        Flags(slot) = (byte)(flags & ~(HasOldFlag | CapturedFlag));
+                        if ((flags & LiveFlag) == 0) Release(slot);
+                    }
+                    if (index < captured.Count) continue;
+                    // Nothing retained remains: close under the same gate hold, so no writer can capture in between.
+                    captured.Clear();
+                    view.Closed = true;
+                    view.ListSeen = null;
+                    Volatile.Write(ref active, null);
+                    if (dropChangesOnClose)
+                    {
+                        changedSlots?.Clear();
+                        dropChangesOnClose = false;
+                    }
+                    return;
+                }
+                finally { Monitor.Exit(gate); }
             }
         }
 
@@ -395,8 +508,15 @@ namespace Garnet.server
         ref int ModEpoch(int slot) => ref Seg(slot).ModEpochs[slot & SegmentMask];
         ref int OldModEpoch(int slot) => ref Seg(slot).OldModEpochs[slot & SegmentMask];
 
-        void CountChange()
+        void CountChange(int slot)
         {
+            if (changedSlots is not null)
+            {
+                changedSlots.Add((epoch, slot, Id(slot)));
+                // Past a quarter of the set the next chain file is full anyway: drop the list (and the base) to bound memory.
+                if (changedSlots.Count > (live.Count >> 2) + 1024 && !dropChangesOnClose)
+                    DropBase();
+            }
             if (changes.Count > 0 && changes[^1].Epoch == epoch)
                 changes[^1] = (epoch, changes[^1].Count + 1);
             else
@@ -427,7 +547,7 @@ namespace Garnet.server
                     if (ModEpoch(slot) != epoch)
                     {
                         ModEpoch(slot) = epoch;
-                        CountChange();
+                        CountChange(slot);
                     }
                     return;
                 }
@@ -439,8 +559,8 @@ namespace Garnet.server
                 Id(slot) = id;
                 Score(slot) = score;
                 ModEpoch(slot) = epoch;
-                CountChange();
                 Flags(slot) = LiveFlag;
+                CountChange(slot);
                 Prev(slot) = tail;
                 Next(slot) = None;
                 if (tail == None) head = slot;
@@ -451,7 +571,7 @@ namespace Garnet.server
         }
 
         bool Pending(int slot) => active is { Closed: false } view && Id(slot) <= view.Limit
-            && view.Cursor != None && Id(slot) >= Id(view.Cursor);
+            && (view.ListRead || (view.Cursor != None && Id(slot) >= Id(view.Cursor)));
 
         void Capture(int slot)
         {
@@ -459,6 +579,14 @@ namespace Garnet.server
             OldScore(slot) = Score(slot);
             OldModEpoch(slot) = ModEpoch(slot);
             Flags(slot) |= HasOldFlag;
+            MarkCaptured(slot);
+        }
+
+        void MarkCaptured(int slot)
+        {
+            if ((Flags(slot) & CapturedFlag) != 0) return;
+            Flags(slot) |= CapturedFlag;
+            captured.Add(slot);
         }
 
         void Validate(View view)

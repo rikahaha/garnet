@@ -12,7 +12,8 @@ Environment:
   MEM           log memory limit (-m), default 8g. Without --storage-tier Garnet evicts whole keys past it, so use a large value.
 Writes <out_prefix>.json (benchmark output), <out_prefix>_trace.csv (server checkpoint trace), <out_prefix>_server.log,
 <out_prefix>_delta.csv (sorted set side store writes), <out_prefix>_ckptbytes.txt (bytes of the last checkpoint's files) and
-<out_prefix>_sizes.txt (ZCARD of every set at the end, to detect eviction).
+<out_prefix>_sizes.txt (ZCARD of every set at the end, to detect eviction), <out_prefix>_rss.txt (server RSS in KB at the end)
+and <out_prefix>_gc.csv (GC counts and total pause every 10 ms).
 """
 import os, shlex, shutil, signal, socket, subprocess, sys, time
 
@@ -33,17 +34,21 @@ def main():
     shutil.rmtree(WORK, ignore_errors=True); os.makedirs(WORK)
     trace = f"{WORK}/trace.csv"
     delta = f"{WORK}/delta.csv"
+    gc = f"{WORK}/gc.csv"
     log = open(f"{WORK}/server.log", "w")
     server = subprocess.Popen([*cmd("GARNET_NUMA", "GARNET_BIN", LOCAL_GARNET), "--port", str(PORT), "--checkpointdir", f"{WORK}/ckpt",
                                "--device-type", "RandomAccess", "--logger-level", "Information", "-m", os.environ.get("MEM", "8g"), "-i", "64m"],
                               stdout=log, stderr=subprocess.STDOUT,
-                              env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet", "TSAVORITE_COU_TRACE": trace, "GARNET_DELTA_TRACE": delta})
+                              env={**os.environ, "DOTNET_ROOT": "/usr/local/share/dotnet", "TSAVORITE_COU_TRACE": trace, "GARNET_DELTA_TRACE": delta, "GARNET_GC_TRACE": gc})
     try:
         for _ in range(600):
             try: socket.create_connection(("127.0.0.1", PORT)).close(); break
             except OSError: time.sleep(0.1)
         with open(f"{out}.json", "w") as f:
             subprocess.run([*cmd("CLIENT_NUMA", "BENCH_BIN", LOCAL_BENCH), *bench_args], stdout=f, check=True)
+        # Server memory at the end (resident set, KB), to compare the bookkeeping cost of the configurations.
+        rss = subprocess.run(["ps", "-o", "rss=", "-p", str(server.pid)], capture_output=True, text=True).stdout.strip()
+        open(f"{out}_rss.txt", "w").write(f"{rss}\n")
         sets = int(next((x.split("=", 1)[1] for x in bench_args if x.startswith("sets=")), "20"))
         with socket.create_connection(("127.0.0.1", PORT)) as c, open(f"{out}_sizes.txt", "w") as f:
             r = c.makefile("rb")
@@ -56,6 +61,7 @@ def main():
         log.close()
         if os.path.exists(trace): shutil.copy(trace, f"{out}_trace.csv")
         if os.path.exists(delta): shutil.copy(delta, f"{out}_delta.csv")
+        if os.path.exists(gc): shutil.copy(gc, f"{out}_gc.csv")
         with open(f"{out}_ckptbytes.txt", "w") as f:
             # Files of the checkpoint that is kept (snapshot, metadata, index) and the side store; not the main log.
             for name in ("cpr-checkpoints", "index-checkpoints", "sortedset-members"):

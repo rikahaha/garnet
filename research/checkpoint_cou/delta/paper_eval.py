@@ -14,7 +14,9 @@
 
 Environment: GARNET_BIN / BENCH_BIN / RB_BIN (Resp.bench) self-contained executables (default: local builds via dotnet),
 GARNET_NUMA / CLIENT_NUMA command prefixes, MEM (log memory limit, default 32g), REPS (default 2).
-Usage: paper_eval.py <out_dir> [zaddrem] [savetime] [rounds] [scaling]
+  listcmp   Delta writes from the change list vs by scanning every member (and baseline, viewpooled): uniform load, 16 / 64 / 128
+            clients, 6 checkpoints; phase timing (delta trace), server RSS and GC traces.
+Usage: paper_eval.py <out_dir> [zaddrem] [savetime] [rounds] [scaling] [listcmp]
 """
 import csv, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time
 
@@ -32,8 +34,11 @@ REPS = int(os.environ.get("REPS", 2))
 CONFIGS = {
     "baseline": {"GARNET_SORTEDSET_MEMBER_CHECKPOINT": "0", "TSAVORITE_SERIALIZE_POOLED": "0", "GARNET_SORTEDSET_DELTA": "0"},
     "viewpooled": {"GARNET_SORTEDSET_MEMBER_CHECKPOINT": "1", "TSAVORITE_SERIALIZE_POOLED": "1", "GARNET_SORTEDSET_DELTA": "0"},
-    "delta": {"GARNET_SORTEDSET_MEMBER_CHECKPOINT": "1", "TSAVORITE_SERIALIZE_POOLED": "1", "GARNET_SORTEDSET_DELTA": "1"},
+    "delta": {"GARNET_SORTEDSET_MEMBER_CHECKPOINT": "1", "TSAVORITE_SERIALIZE_POOLED": "1", "GARNET_SORTEDSET_DELTA": "1",
+              "GARNET_SORTEDSET_DELTA_LIST": "1"},
 }
+# Only for listcmp: deltas found by scanning every member (the implementation before the change list).
+DELTA_SCAN = {**CONFIGS["delta"], "GARNET_SORTEDSET_DELTA_LIST": "0"}
 
 
 def exe(name):
@@ -226,6 +231,26 @@ def rounds(out):
         f.writelines(",".join(map(str, r)) + "\n" for r in summary)
 
 
+def listcmp(out):
+    """Change list vs scan: uniform load, 16 / 64 / 128 clients, 6 checkpoints 7 s apart; phase timing, RSS and GC traces kept."""
+    run = os.path.join(HERE, "../throughput/throughput_run.py")
+    analyze = os.path.join(HERE, "../throughput/throughput_analyze.py")
+    saves = [5 + 7 * i for i in range(6)]
+    configs = {**CONFIGS, "delta_scan": DELTA_SCAN}
+    for rep in range(1, REPS + 1):
+        for clients in os.environ.get("LISTCMP_CLIENTS", "16 64 128").split():
+            for config in ("baseline", "viewpooled", "delta_scan", "delta"):
+                name = f"{out}/listcmp_{config}_c{clients}_r{rep}"
+                env = {**os.environ, **configs[config], "MEM": MEM}
+                args = ["members=1000000", "sets=20", f"clients={clients}", "pipeline=1", "readpct=50", f"run={saves[-1] + 5}",
+                        "saveat=" + ",".join(map(str, saves))]
+                subprocess.run([sys.executable, "-I", run, name, *args], env=env, check=True, stderr=subprocess.DEVNULL)
+                subprocess.run([sys.executable, "-I", analyze, name], check=True)
+                sizes = {int(l.split()[1]) for l in open(f"{name}_sizes.txt")}
+                if sizes != {1000000}:
+                    print(f"  WARNING {name}: set sizes at the end {sorted(sizes)}", flush=True)
+
+
 def savetime(out):
     rows = []
     for rep in range(1, REPS + 1):
@@ -276,5 +301,5 @@ if __name__ == "__main__":
     out = os.path.abspath(sys.argv[1])
     os.makedirs(out, exist_ok=True)
     for what in sys.argv[2:] or ["zaddrem", "savetime", "rounds", "scaling"]:
-        {"zaddrem": zaddrem, "scaling": scaling, "savetime": savetime, "rounds": rounds}[what](out)
+        {"zaddrem": zaddrem, "scaling": scaling, "savetime": savetime, "rounds": rounds, "listcmp": listcmp}[what](out)
     shutil.rmtree(os.path.join(out, "work"), ignore_errors=True)
